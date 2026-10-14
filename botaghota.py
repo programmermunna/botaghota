@@ -162,7 +162,12 @@ class Storage:
 
     def __init__(self, path: str):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        self._conn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
+        # check_same_thread=False: the crawler loop may run in a worker
+        # thread; all access below is serialized by _lock anyway.
+        self._conn = sqlite3.connect(path, timeout=30.0,
+                                     isolation_level=None,
+                                     check_same_thread=False)
+        self._lock = threading.RLock()
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA)
 
@@ -176,69 +181,82 @@ class Storage:
     # -- seen set ----------------------------------------------------------
 
     def is_seen(self, url: str) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM seen WHERE hash = ?", (url_hash(url),)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM seen WHERE hash = ?", (url_hash(url),)
+            ).fetchone()
         return row is not None
 
     def mark_seen(self, url: str) -> None:
-        self._conn.execute(
-            "INSERT OR IGNORE INTO seen(hash) VALUES (?)", (url_hash(url),)
-        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO seen(hash) VALUES (?)",
+                (url_hash(url),),
+            )
 
     # -- frontier ----------------------------------------------------------
 
     def enqueue(self, url: str, depth: int, priority: float = 0.0,
                 next_fetch: float = 0.0) -> bool:
-        cur = self._conn.execute(
-            "INSERT OR IGNORE INTO queue(url_hash, url, depth, priority,"
-            " next_fetch) VALUES (?, ?, ?, ?, ?)",
-            (url_hash(url), url, depth, priority, next_fetch),
-        )
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO queue(url_hash, url, depth,"
+                " priority, next_fetch) VALUES (?, ?, ?, ?, ?)",
+                (url_hash(url), url, depth, priority, next_fetch),
+            )
         return cur.rowcount > 0
 
     def dequeue(self, now: Optional[float] = None) -> Optional[tuple]:
         """Pop the highest-priority due URL, atomically."""
         now = time.time() if now is None else now
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute(
-                "SELECT url_hash, url, depth FROM queue"
-                " WHERE next_fetch <= ?"
-                " ORDER BY priority DESC, next_fetch, url_hash LIMIT 1",
-                (now,),
-            ).fetchone()
-            if row:
-                self._conn.execute(
-                    "DELETE FROM queue WHERE url_hash = ?", (row[0],)
-                )
-            self._conn.execute("COMMIT")
-        except sqlite3.Error:
-            self._conn.execute("ROLLBACK")
-            raise
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT url_hash, url, depth FROM queue"
+                    " WHERE next_fetch <= ?"
+                    " ORDER BY priority DESC, next_fetch, url_hash"
+                    " LIMIT 1",
+                    (now,),
+                ).fetchone()
+                if row:
+                    self._conn.execute(
+                        "DELETE FROM queue WHERE url_hash = ?", (row[0],)
+                    )
+                self._conn.execute("COMMIT")
+            except sqlite3.Error:
+                self._conn.execute("ROLLBACK")
+                raise
         return (row[1], row[2]) if row else None
 
     def queue_size(self) -> int:
-        return self._conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM queue").fetchone()[0]
 
     def seen_size(self) -> int:
-        return self._conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM seen").fetchone()[0]
 
     # -- page records ------------------------------------------------------
 
     def record_page(self, url: str, status: Optional[int], depth: int) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO pages(url_hash, url, fetched_at, status,"
-            " depth, domain) VALUES (?, ?, ?, ?, ?, ?)",
-            (url_hash(url), url, time.time(), status, depth, domain_of(url)),
-        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO pages(url_hash, url, fetched_at,"
+                " status, depth, domain) VALUES (?, ?, ?, ?, ?, ?)",
+                (url_hash(url), url, time.time(), status, depth,
+                 domain_of(url)),
+            )
 
     def top_domains(self, limit: int = 10) -> list:
-        return self._conn.execute(
-            "SELECT domain, COUNT(*) AS n FROM pages"
-            " GROUP BY domain ORDER BY n DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        with self._lock:
+            return self._conn.execute(
+                "SELECT domain, COUNT(*) AS n FROM pages"
+                " GROUP BY domain ORDER BY n DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
 
 
 # --------------------------------------------------------------------------
@@ -576,8 +594,9 @@ class Crawler:
         status, html = self.fetcher.fetch(url)
         if status is None:
             self.errors["network"] += 1
-            self.polite.note_failure(host)
-            self.storage.mark_seen(url)   # count it: do not hammer dead URLs
+            # A dropped connection is URL-level trouble, not a signal the
+            # host wants slower crawling — mark seen, count, move on.
+            self.storage.mark_seen(url)
             return
         if status == 429 or status >= 500:
             key = f"http_{status}"
