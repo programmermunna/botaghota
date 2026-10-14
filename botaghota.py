@@ -24,6 +24,8 @@ import argparse
 import asyncio
 import gzip
 import hashlib
+import importlib
+import importlib.util
 import json
 import logging
 import mmap
@@ -676,6 +678,49 @@ class LinkExtractor(HTMLParser):
                 self.canonical = attrs["href"]
 
 
+class PageInfoParser(HTMLParser):
+    """Extracts <title>, meta description, and <html lang> for --extract."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title: Optional[str] = None
+        self.description: Optional[str] = None
+        self.lang: Optional[str] = None
+        self._in_title = False
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        attrs = dict(attrs)
+        if tag == "html":
+            self.lang = attrs.get("lang") or self.lang
+        elif tag == "title":
+            self._in_title = True
+        elif tag == "meta":
+            name = (attrs.get("name") or attrs.get("property") or "").lower()
+            if name in ("description", "og:description") \
+                    and attrs.get("content") and not self.description:
+                self.description = attrs["content"].strip()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title and self.title is None:
+            self.title = data.strip()
+
+
+def default_extract(url: str, html: str) -> dict:
+    """Built-in extractor: title, meta description, language."""
+    parser = PageInfoParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        pass
+    return {"title": parser.title, "description": parser.description,
+            "lang": parser.lang}
+
+
 def extract_links(html: str, base_url: str) -> tuple[list[str],
                                                      Optional[str]]:
     """Returns (cleaned absolute outlinks, canonical URL or None)."""
@@ -798,14 +843,63 @@ class Politeness:
 
 
 # --------------------------------------------------------------------------
+# --extract plugins
+# --------------------------------------------------------------------------
+
+def load_extractors(specs: Optional[list]) -> list:
+    """Resolve --extract specs into extract(url, html) -> dict callables.
+
+    A spec is 'default' (built-in title/description/lang extractor), a
+    path to a .py file, or an importable module name. Each module must
+    define `extract(url, html) -> dict`.
+    """
+    if specs is None:
+        return []
+    if not specs:
+        specs = ["default"]   # bare '--extract' flag
+    extractors = []
+    for spec in specs:
+        if spec in ("default", "builtin"):
+            extractors.append(("default", default_extract))
+            continue
+        module = None
+        if spec.endswith(".py") and os.path.exists(spec):
+            name = os.path.splitext(os.path.basename(spec))[0]
+            spec_obj = importlib.util.spec_from_file_location(name, spec)
+            module = importlib.util.module_from_spec(spec_obj)
+            spec_obj.loader.exec_module(module)
+        else:
+            try:
+                module = importlib.import_module(spec)
+            except ImportError:
+                # Last resort: a plugin under ./plugins/
+                plugin_path = os.path.join("plugins", spec + ".py")
+                if os.path.exists(plugin_path):
+                    spec_obj = importlib.util.spec_from_file_location(
+                        spec, plugin_path)
+                    module = importlib.util.module_from_spec(spec_obj)
+                    spec_obj.loader.exec_module(module)
+                else:
+                    raise
+        fn = getattr(module, "extract", None)
+        if not callable(fn):
+            raise ValueError(
+                f"--extract plugin {spec!r} must define "
+                "extract(url, html) -> dict")
+        extractors.append((spec, fn))
+    return extractors
+
+
+# --------------------------------------------------------------------------
 # Atomic state file + daily link files
 # --------------------------------------------------------------------------
 
 class DailyLinkWriter:
-    """Appends crawled URLs to crawled_links/YYYY-MM-DD.txt, fsynced."""
+    """Appends records to <dir>/YYYY-MM-DD<ext>, fsynced per write."""
 
-    def __init__(self, directory: str):
+    def __init__(self, directory: str, ext: str = ".txt"):
         self._dir = directory
+        self._ext = ext
         os.makedirs(directory, exist_ok=True)
         self._file = None
         self._day = None
@@ -818,7 +912,7 @@ class DailyLinkWriter:
                 os.fsync(self._file.fileno())
                 self._file.close()
             self._day = day
-            path = os.path.join(self._dir, f"{day}.txt")
+            path = os.path.join(self._dir, f"{day}{self._ext}")
             self._file = open(path, "a", encoding="utf-8", buffering=1)
         return self._file
 
@@ -827,6 +921,12 @@ class DailyLinkWriter:
         f.write(url + "\n")
         f.flush()
         os.fsync(f.fileno())   # survive kill -9 / power loss
+
+    def write_json(self, record: dict) -> None:
+        f = self._current()
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
     def close(self) -> None:
         if self._file:
@@ -882,6 +982,10 @@ class Crawler:
         self.started_at = time.time()
         self._stop = threading.Event()
         self._last_state_flush = 0.0
+        self.extractors = load_extractors(args.extract)
+        self.json_writer = (
+            DailyLinkWriter(os.path.join(self.data_dir, "extracted"),
+                            ext=".jsonl") if self.extractors else None)
         self._closed = False
         self._seed_urls: list[str] = []
 
@@ -1041,9 +1145,35 @@ class Crawler:
             self.storage.mark_seen(canonical)
         if first_crawl:
             self.writer.write(out_url)   # daily files stay duplicate-free
+            self.run_extractors(out_url, html, status, depth)
 
         for link in links:
             self.enqueue_link(link, depth + 1)
+
+    def run_extractors(self, url: str, html: str, status: int,
+                       depth: int) -> None:
+        if not self.extractors:
+            return
+        base = {
+            "url": url,
+            "status": status,
+            "depth": depth,
+            "fetched_at": time.time(),
+            "content_hash": hashlib.blake2b(
+                html.encode("utf-8", "replace"),
+                digest_size=16).hexdigest(),
+        }
+        for name, fn in self.extractors:
+            try:
+                record = dict(base)
+                record["extractor"] = name
+                data = fn(url, html)
+                if isinstance(data, dict):
+                    record.update(data)
+                self.json_writer.write_json(record)
+            except Exception as e:
+                self.errors["extract"] += 1
+                LOG.debug("extractor %s failed on %s: %s", name, url, e)
 
     def enqueue_link(self, link: str, depth: int,
                      priority: float = 0.0) -> bool:
@@ -1085,6 +1215,8 @@ class Crawler:
         self._closed = True
         self.maybe_flush_state(force=True)
         self.writer.close()
+        if self.json_writer:
+            self.json_writer.close()
         self.storage.close()
 
     # -- stats -------------------------------------------------------------
@@ -1145,6 +1277,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bloom-mbits", type=int, default=512,
                    help="Bloom filter size in mebibits, used with --bloom "
                         "(default: 512 = 64 MiB file, ~100M URLs)")
+    p.add_argument("--extract", nargs="*", default=None, metavar="PLUGIN",
+                   help="Extract per-page metadata to "
+                        "extracted/YYYY-MM-DD.jsonl. Bare '--extract' uses "
+                        "the built-in title/description/lang extractor; "
+                        "otherwise pass plugin .py paths or module names "
+                        "defining extract(url, html) -> dict.")
     p.add_argument("--stats", action="store_true",
                    help="Print crawl statistics and exit")
     p.add_argument("-v", "--verbose", action="store_true",

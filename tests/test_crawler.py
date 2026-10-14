@@ -195,6 +195,42 @@ def test_bloom_mode_crawls_and_persists(site, tmp_path):
     assert (tmp_path / "bloom.bits").stat().st_size == (1024 * 1024) // 8
 
 
+def test_extract_writes_jsonl(site, tmp_path):
+    import json as _json
+    site.pages["/"] = (200, "text/html",
+                       '<html lang="en"><head><title>Home</title>'
+                       '<meta name="description" content="the home page">'
+                       "</head><body></body></html>")
+    run_crawler(tmp_path, [site.base_url + "/"], seconds=2.0,
+                extra_args=("--extract",))
+    out = list((tmp_path / "extracted").glob("*.jsonl"))
+    assert out, "no .jsonl output"
+    rec = _json.loads(out[0].read_text().splitlines()[0])
+    assert rec["url"] == site.base_url + "/"
+    assert rec["title"] == "Home"
+    assert rec["description"] == "the home page"
+    assert rec["lang"] == "en"
+    assert rec["status"] == 200
+    assert "content_hash" in rec
+
+
+def test_extract_custom_plugin(site, tmp_path):
+    plugin = tmp_path / "myplugin.py"
+    plugin.write_text(
+        "def extract(url, html):\n"
+        "    return {'n_links': html.count('<a ')}\n")
+    site.pages["/"] = page(links=["/p0.html"])
+    site.pages["/p0.html"] = page()
+    run_crawler(tmp_path, [site.base_url + "/"], seconds=2.0,
+                extra_args=("--extract", str(plugin)))
+    import json as _json
+    rec = _json.loads(
+        next((tmp_path / "extracted").glob("*.jsonl"))
+        .read_text().splitlines()[0])
+    assert rec["extractor"] == str(plugin)
+    assert rec["n_links"] == 1
+
+
 def test_stats_runs(site, tmp_path, capsys):
     build_site(site, n=3)
     run_crawler(tmp_path, [site.base_url + "/"], seconds=2.0)
