@@ -37,6 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import urllib.robotparser
+import xml.etree.ElementTree
 from collections import defaultdict
 from html.parser import HTMLParser
 from typing import Optional
@@ -147,6 +148,11 @@ CREATE TABLE IF NOT EXISTS inflight (
     url       TEXT NOT NULL,
     depth     INTEGER NOT NULL,
     claimed_at REAL NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS domains (
+    domain      TEXT PRIMARY KEY,
+    first_seen  REAL NOT NULL,
+    sitemap_done INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS pages (
     url_hash   INTEGER PRIMARY KEY,
@@ -342,6 +348,44 @@ class Storage:
                 (domain,),
             ).fetchone()[0]
 
+    # -- domains (frontier scoring + sitemap tracking) ---------------------
+
+    def note_domain(self, domain: str) -> bool:
+        """Record a domain; returns True the first time it is seen."""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO domains(domain, first_seen)"
+                " VALUES (?, ?)",
+                (domain, time.time()),
+            )
+        return cur.rowcount > 0
+
+    def claim_sitemap(self, domain: str) -> bool:
+        """Atomically flip sitemap_done for a domain; True once per domain."""
+        with self._lock:
+            self.note_domain(domain)
+            cur = self._conn.execute(
+                "UPDATE domains SET sitemap_done = 1"
+                " WHERE domain = ? AND sitemap_done = 0",
+                (domain,),
+            )
+        return cur.rowcount > 0
+
+    def last_fetched(self, url: str) -> Optional[float]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fetched_at FROM pages WHERE url_hash = ?",
+                (url_hash(url),),
+            ).fetchone()
+        return row[0] if row else None
+
+    def page_known(self, url: str) -> bool:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM pages WHERE url_hash = ?",
+                (url_hash(url),),
+            ).fetchone() is not None
+
 
 # --------------------------------------------------------------------------
 # robots.txt
@@ -398,6 +442,13 @@ class RobotsCache:
             return None
         delay = rp.crawl_delay(USER_AGENT)
         return float(delay) if delay else None
+
+    def sitemaps(self, url: str) -> list:
+        """Sitemap URL(s) declared in robots.txt, if any."""
+        rp = self._entry(url)
+        if rp is None or rp == "DENY":
+            return []
+        return list(rp.site_maps() or [])
 
 
 # --------------------------------------------------------------------------
@@ -490,6 +541,67 @@ def extract_links(html: str, base_url: str) -> list[str]:
         if cleaned:
             out.append(cleaned)
     return out
+
+
+# --------------------------------------------------------------------------
+# sitemap.xml
+# --------------------------------------------------------------------------
+
+MAX_SITEMAP_URLS = 50_000
+
+
+def parse_sitemap(data: bytes) -> tuple[list[str], list[str]]:
+    """Parse sitemap XML. Returns (page_urls, child_sitemap_urls)."""
+    try:
+        root = xml.etree.ElementTree.fromstring(data)
+    except xml.etree.ElementTree.ParseError:
+        return [], []
+    tag = root.tag.rsplit("}", 1)[-1]
+    pages: list[str] = []
+    children: list[str] = []
+    if tag == "sitemapindex":
+        for sm in root:
+            loc = sm.findtext("{*}loc")
+            if loc:
+                children.append(loc.strip())
+    elif tag == "urlset":
+        for u in root:
+            loc = u.findtext("{*}loc")
+            if loc:
+                pages.append(loc.strip())
+    return pages, children
+
+
+async def discover_sitemap_urls(crawler: "Crawler", page_url: str,
+                                domain: str) -> None:
+    """Fetch sitemap(s) for a host once and enqueue the URLs found."""
+    parts = urllib.parse.urlsplit(page_url)
+    maps = crawler.robots.sitemaps(page_url)[:5]
+    if not maps:
+        maps = [f"{parts.scheme}://{parts.netloc}/sitemap.xml"]
+    total = 0
+    for sm_url in maps:
+        status, body = await asyncio.to_thread(
+            crawler.fetcher.fetch_raw, sm_url)
+        if status != 200 or body is None:
+            continue
+        pages, children = parse_sitemap(body)
+        # One level of sitemap indexes is enough.
+        for child in children[:10]:
+            cstatus, cbody = await asyncio.to_thread(
+                crawler.fetcher.fetch_raw, child)
+            if cstatus == 200 and cbody is not None:
+                c_pages, _ = parse_sitemap(cbody)
+                pages.extend(c_pages)
+        for raw in pages:
+            if total >= MAX_SITEMAP_URLS:
+                return
+            cleaned = clean_url(raw)
+            if cleaned and crawler.enqueue_link(cleaned, depth=0,
+                                                priority=1.5):
+                total += 1
+        if total:
+            LOG.info("sitemap %s: enqueued %d URL(s)", sm_url, total)
 
 
 # --------------------------------------------------------------------------
@@ -641,7 +753,8 @@ class Crawler:
                           seed)
                 continue
             self._seed_urls.append(cleaned)
-            self.storage.enqueue(cleaned, depth=0, priority=1.0)
+            self.storage.note_domain(domain_of(cleaned))
+            self.storage.enqueue(cleaned, depth=0, priority=3.0)
         workers = [
             asyncio.create_task(self._worker(i), name=f"w{i}")
             for i in range(max(1, self.args.workers))
@@ -659,12 +772,27 @@ class Crawler:
             self.maybe_flush_state()
             await asyncio.sleep(STATE_FLUSH_INTERVAL)
 
-    def _reseed(self, seeds_seen: list[str]) -> int:
+    def _reseed(self, seeds: list[str]) -> int:
         n = 0
-        for seed in seeds_seen:
-            if self.storage.enqueue(seed, depth=0, priority=1.0):
+        for seed in seeds:
+            if self.maybe_recrawl(seed, depth=0):
+                n += 1
+            elif self.storage.enqueue(seed, depth=0, priority=3.0):
                 n += 1
         return n
+
+    def maybe_recrawl(self, url: str, depth: int) -> bool:
+        """If a seen URL is stale enough, schedule a recrawl."""
+        interval = self.args.recrawl_hours * 3600
+        if interval <= 0:
+            return False
+        last = self.storage.last_fetched(url)
+        if last is None:
+            return False
+        if time.time() - last < interval:
+            return False
+        self.storage.requeue(url, depth, next_fetch=time.time())
+        return True
 
     async def _worker(self, worker_id: int) -> None:
         while not self._stop.is_set():
@@ -713,6 +841,12 @@ class Crawler:
             self.errors["robots_denied"] += 1
             LOG.debug("robots.txt denies %s", url)
             return
+        if self.args.sitemap and self.storage.claim_sitemap(domain):
+            try:
+                await discover_sitemap_urls(self, url, domain)
+            except Exception as e:   # sitemap trouble never kills a crawl
+                self.errors["sitemap"] += 1
+                LOG.debug("sitemap discovery failed for %s: %s", domain, e)
         delay = await asyncio.to_thread(self.robots.crawl_delay, url)
         host = host_of(url)
         status, html = await asyncio.to_thread(self.fetcher.fetch, url)
@@ -736,8 +870,10 @@ class Crawler:
             self.storage.record_page(url, status, depth)
             return
 
+        first_crawl = not self.storage.page_known(url)
         self.storage.record_page(url, status, depth)
-        self.writer.write(url)
+        if first_crawl:
+            self.writer.write(url)   # daily files stay duplicate-free
         self.pages_done += 1
         LOG.info("[%d] %s (%s)", self.pages_done, url,
                  asyncio.current_task().get_name())
@@ -747,11 +883,15 @@ class Crawler:
 
     def enqueue_link(self, link: str, depth: int,
                      priority: float = 0.0) -> bool:
-        """Dedup + trap-check + enqueue an outgoing link."""
+        """Dedup + trap-check + priority-scored enqueue of an outlink."""
         if self.storage.is_seen(link):
+            self.maybe_recrawl(link, depth)
             return False
         if looks_like_trap(link, self.args.max_depth, depth):
             return False
+        is_new_domain = self.storage.note_domain(domain_of(link))
+        if priority <= 0 and is_new_domain:
+            priority = 2.0   # never-before-seen domain: crawl first
         return self.storage.enqueue(link, depth=depth, priority=priority)
 
     # -- state -------------------------------------------------------------
@@ -828,6 +968,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Stop after N pages (0 = run forever)")
     p.add_argument("--workers", type=int, default=1,
                    help="Concurrent fetch workers (default: 1)")
+    p.add_argument("--recrawl-hours", type=float, default=24.0,
+                   help="Recrawl a page after this many hours "
+                        "(0 = never recrawl; default: 24)")
+    p.add_argument("--no-sitemap", dest="sitemap", action="store_false",
+                   help="Do not fetch sitemap.xml for new domains")
+    p.set_defaults(sitemap=True)
     p.add_argument("--stats", action="store_true",
                    help="Print crawl statistics and exit")
     p.add_argument("-v", "--verbose", action="store_true",

@@ -129,6 +129,43 @@ def test_crash_recovery_no_duplicates(site, tmp_path):
     assert expected.issubset(set(urls)), "lost links after crash"
 
 
+def test_sitemap_discovery(site, tmp_path):
+    """URLs only reachable via sitemap.xml are crawled once per domain."""
+    site.pages["/"] = page()
+    site.pages["/sm1.html"] = page()
+    site.pages["/sm2.html"] = page()
+    site.sitemap = (
+        '<?xml version="1.0"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        f"<url><loc>{site.base_url}/sm1.html</loc></url>"
+        f"<url><loc>{site.base_url}/sm2.html</loc></url>"
+        "</urlset>")
+    run_crawler(tmp_path, [site.base_url + "/"], seconds=3.0)
+    urls = set(all_crawled_urls(tmp_path))
+    assert site.base_url + "/sm1.html" in urls
+    assert site.base_url + "/sm2.html" in urls
+
+
+def test_recrawl_after_interval(site, tmp_path):
+    """A stale page is refetched once its recrawl interval passes."""
+    import sqlite3
+    build_site(site, n=2)
+    run_crawler(tmp_path, [site.base_url + "/"], seconds=2.0)
+    hits_first = site.hits.get("/p0.html", 0)
+    assert hits_first >= 1
+    # Age every page beyond the recrawl interval.
+    conn = sqlite3.connect(str(tmp_path / "botaghota.db"))
+    conn.execute("UPDATE pages SET fetched_at = fetched_at - 100000")
+    conn.commit()
+    conn.close()
+    run_crawler(tmp_path, [site.base_url + "/"], seconds=2.5,
+                extra_args=("--recrawl-hours", "0.001"))
+    assert site.hits.get("/p0.html", 0) > hits_first
+    # Recrawls never duplicate lines in the daily files.
+    urls = all_crawled_urls(tmp_path)
+    assert len(urls) == len(set(urls))
+
+
 def test_stats_runs(site, tmp_path, capsys):
     build_site(site, n=3)
     run_crawler(tmp_path, [site.base_url + "/"], seconds=2.0)

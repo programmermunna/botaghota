@@ -59,3 +59,29 @@ def test_extract_links_resolves_relative():
     links = botaghota.extract_links(html, "http://example.com/a/")
     assert "http://example.com/b" in links
     assert "http://example.com/a/c.html" in links
+
+
+def test_parse_sitemap_urlset():
+    xml = (
+        '<?xml version="1.0"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        "<url><loc>http://x/a</loc><lastmod>2026-01-01</lastmod></url>"
+        "<url><loc>http://x/b</loc></url>"
+        "</urlset>").encode()
+    pages, children = botaghota.parse_sitemap(xml)
+    assert pages == ["http://x/a", "http://x/b"]
+    assert children == []
+
+
+def test_parse_sitemap_index():
+    xml = (
+        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        "<sitemap><loc>http://x/sm1.xml</loc></sitemap>"
+        "</sitemapindex>").encode()
+    pages, children = botaghota.parse_sitemap(xml)
+    assert pages == []
+    assert children == ["http://x/sm1.xml"]
+
+
+def test_parse_sitemap_garbage():
+    assert botaghota.parse_sitemap(b"not xml") == ([], [])
