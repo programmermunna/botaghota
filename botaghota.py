@@ -495,6 +495,24 @@ class Storage:
                 (domain,),
             ).fetchone()[0]
 
+    def pages_count(self) -> int:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM pages").fetchone()[0]
+
+    def status_counts(self) -> list:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT status, COUNT(*) FROM pages GROUP BY status"
+                " ORDER BY 2 DESC").fetchall()
+
+    def crawl_timespan(self) -> tuple:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(fetched_at), MAX(fetched_at) FROM pages"
+            ).fetchone()
+        return (row[0], row[1]) if row else (None, None)
+
     # -- domains (frontier scoring + sitemap tracking) ---------------------
 
     def note_domain(self, domain: str) -> bool:
@@ -562,7 +580,8 @@ class RobotsCache:
         elif status is not None and 400 <= status < 500:
             self._cache[host] = (None, now + ROBOTS_TTL)  # no rules: allow
         else:
-            rp.parse([])   # unreachable: robots fetch failed
+            # robots fetch failed (5xx/network): deny for a while rather
+            # than hammering a struggling host.
             self._cache[host] = ("DENY", now + ROBOTS_DENY_TTL)
 
     def _entry(self, url: str):
@@ -960,6 +979,78 @@ def write_state(path: str, state: dict) -> None:
 
 
 # --------------------------------------------------------------------------
+# Optional local dashboard (stdlib http.server)
+# --------------------------------------------------------------------------
+
+DASHBOARD_HTML = """<!doctype html><meta charset=utf-8>
+<title>botaghota</title>
+<meta http-equiv=refresh content=5>
+<style>body{font-family:monospace;margin:2em}td{padding:2px 12px}
+h1{font-size:1.3em}table{border-collapse:collapse}
+td:first-child{color:#666}</style>
+<h1>botaghota</h1><div id=s>loading...</div>
+<script>
+async function go(){
+ const s = await (await fetch('/api/state')).json();
+ let h = '<table>';
+ for (const k of ['total_pages','pages','seen','queue','pages_per_hour',
+                  'lifetime_pages_per_hour','workers','bloom'])
+  h += `<tr><td>${k}</td><td>${s[k] ?? '-'}</td></tr>`;
+ h += '</table><h2>errors</h2><table>';
+ for (const [k,v] of Object.entries(s.errors||{}))
+  h += `<tr><td>${k}</td><td>${v}</td></tr>`;
+ h += '</table><h2>top domains</h2><table>';
+ for (const r of s.top_domains||[])
+  h += `<tr><td>${r.domain}</td><td>${r.pages}</td></tr>`;
+ document.getElementById('s').innerHTML = h + '</table>';
+}
+go(); setInterval(go, 5000);
+</script>"""
+
+
+class Dashboard:
+    """Tiny stdlib dashboard: GET / HTML, GET /api/state JSON snapshot."""
+
+    def __init__(self, crawler: "Crawler", port: int):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/api/state":
+                    body = json.dumps(
+                        outer.crawler.snapshot_state()).encode()
+                    ctype = "application/json"
+                elif self.path == "/" or self.path.startswith("/?"):
+                    body = DASHBOARD_HTML.encode()
+                    ctype = "text/html; charset=utf-8"
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.crawler = crawler
+        self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self.port = port
+        self._thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+# --------------------------------------------------------------------------
 # The crawler
 # --------------------------------------------------------------------------
 
@@ -1021,8 +1112,20 @@ class Crawler:
             for i in range(max(1, self.args.workers))
         ]
         flusher = asyncio.create_task(self._flusher())
-        await asyncio.gather(*workers)
-        flusher.cancel()
+        dashboard = None
+        if self.args.dashboard is not None:
+            try:
+                dashboard = Dashboard(self, self.args.dashboard)
+                LOG.info("Dashboard: http://127.0.0.1:%d/",
+                         self.args.dashboard)
+            except OSError as e:
+                LOG.error("Dashboard failed to start: %s", e)
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            flusher.cancel()
+            if dashboard:
+                await asyncio.to_thread(dashboard.stop)
         try:
             await flusher
         except asyncio.CancelledError:
@@ -1192,12 +1295,25 @@ class Crawler:
 
     def snapshot_state(self) -> dict:
         elapsed = max(0.001, time.time() - self.started_at)
+        total_pages = self.storage.pages_count()
+        first, last = self.storage.crawl_timespan()
+        span = (last - first) if first and last and last > first else 0
         return {
             "pages": self.pages_done,
+            "total_pages": total_pages,
             "seen": self.storage.seen_size(),
             "queue": self.storage.queue_size(),
             "pages_per_hour": round(self.pages_done / elapsed * 3600, 1),
+            "lifetime_pages_per_hour":
+                round(total_pages / span * 3600, 1) if span else None,
             "errors": dict(self.errors),
+            "status_counts": {
+                str(k): v for k, v in self.storage.status_counts()},
+            "top_domains": [
+                {"domain": d, "pages": n}
+                for d, n in self.storage.top_domains(10)],
+            "workers": self.args.workers,
+            "bloom": bool(self.storage.bloom),
             "started_at": self.started_at,
             "updated_at": time.time(),
         }
@@ -1223,19 +1339,34 @@ class Crawler:
 
     def print_stats(self) -> None:
         state = self.snapshot_state()
-        print(f"pages crawled : {state['pages']}")
-        print(f"unique seen   : {state['seen']}")
-        print(f"queue size    : {state['queue']}")
-        print(f"pages/hour    : {state['pages_per_hour']}")
-        if self.errors:
+        print(f"pages crawled (total) : {state['total_pages']}")
+        print(f"pages this session    : {state['pages']}")
+        print(f"unique seen           : {state['seen']}")
+        print(f"queue size            : {state['queue']}")
+        print(f"pages/hour (session)  : {state['pages_per_hour']}")
+        if state["lifetime_pages_per_hour"]:
+            print(f"pages/hour (lifetime) : "
+                  f"{state['lifetime_pages_per_hour']}")
+        errors = dict(self.errors)
+        # Merge in errors persisted by previous runs.
+        try:
+            with open(self.state_path, encoding="utf-8") as f:
+                for k, v in (json.load(f).get("errors") or {}).items():
+                    errors[k] = errors.get(k, 0) + v
+        except (OSError, ValueError):
+            pass
+        if errors:
             print("errors:")
-            for kind, n in sorted(self.errors.items(), key=lambda kv: -kv[1]):
-                print(f"  {kind:<14} {n}")
-        top = self.storage.top_domains(10)
-        if top:
+            for kind, n in sorted(errors.items(), key=lambda kv: -kv[1]):
+                print(f"  {kind:<16} {n}")
+        if state["status_counts"]:
+            print("status:")
+            for status, n in state["status_counts"].items():
+                print(f"  {status:<16} {n}")
+        if state["top_domains"]:
             print("top domains:")
-            for domain, n in top:
-                print(f"  {n:>6}  {domain}")
+            for row in state["top_domains"]:
+                print(f"  {row['pages']:>6}  {row['domain']}")
 
 
 # --------------------------------------------------------------------------
@@ -1285,6 +1416,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "defining extract(url, html) -> dict.")
     p.add_argument("--stats", action="store_true",
                    help="Print crawl statistics and exit")
+    p.add_argument("--dashboard", nargs="?", const=8080, type=int,
+                   default=None, metavar="PORT",
+                   help="Serve a tiny stats dashboard on 127.0.0.1:PORT "
+                        "(default port 8080)")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Debug logging")
     return p
