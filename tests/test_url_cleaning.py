@@ -56,9 +56,32 @@ def test_trap_guard_query_blowup():
 
 def test_extract_links_resolves_relative():
     html = '<a href="/b">x</a><a href="c.html">y</a><a href="#f">z</a>'
-    links = botaghota.extract_links(html, "http://example.com/a/")
+    links, canonical = botaghota.extract_links(html,
+                                               "http://example.com/a/")
     assert "http://example.com/b" in links
     assert "http://example.com/a/c.html" in links
+    assert canonical is None
+
+
+def test_clean_url_index_and_trailing_slash():
+    assert clean_url("http://example.com/") == "http://example.com/"
+    assert clean_url("http://example.com/index.html") == \
+        "http://example.com/"
+    assert clean_url("http://example.com/dir/") == "http://example.com/dir"
+    assert clean_url("http://example.com/dir/index.htm") == \
+        "http://example.com/dir"
+
+
+def test_clean_url_query_order():
+    assert clean_url("http://x/?b=2&a=1") == clean_url("http://x/?a=1&b=2")
+
+
+def test_extract_canonical():
+    html = ('<link rel="canonical" href="http://example.com/real">'
+            '<a href="/b">x</a>')
+    links, canonical = botaghota.extract_links(
+        html, "http://example.com/a?utm=1")
+    assert canonical == "http://example.com/real"
 
 
 def test_parse_sitemap_urlset():

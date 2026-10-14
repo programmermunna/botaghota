@@ -26,6 +26,7 @@ import gzip
 import hashlib
 import json
 import logging
+import mmap
 import os
 import signal
 import sqlite3
@@ -89,7 +90,21 @@ def clean_url(url: str) -> Optional[str]:
             and not (scheme == "https" and port == 443):
         netloc = f"{host}:{port}"
     path = parts.path or "/"
-    return urllib.parse.urlunsplit((scheme, netloc, path, parts.query, ""))
+    # /dir/index.html == /dir/ == /dir for dedup purposes.
+    leaf = path.rsplit("/", 1)[-1]
+    if leaf in ("index.html", "index.htm"):
+        path = path[: len(path) - len(leaf)] or "/"
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    # Stable query ordering so ?a=1&b=2 dedups with ?b=2&a=1.
+    query = parts.query
+    if query:
+        try:
+            pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+            query = urllib.parse.urlencode(sorted(pairs))
+        except ValueError:
+            pass
+    return urllib.parse.urlunsplit((scheme, netloc, path, query, ""))
 
 
 def host_of(url: str) -> str:
@@ -130,6 +145,96 @@ def looks_like_trap(url: str, max_depth: int, depth: int) -> bool:
 # Storage: the seen set, the frontier queue, and page records in SQLite
 # --------------------------------------------------------------------------
 
+class BloomSeen:
+    """File-backed Bloom filter for dedup at 100M+ URL scale.
+
+    The bit array lives in an mmap'd file: constant RSS regardless of how
+    many URLs are seen, and it survives kill -9 because mmap dirty pages
+    flush on checkpoint. Trades a small false-positive rate (an unseen URL
+    may be skipped) for this bounded footprint — that is the documented
+    deal of --bloom mode.
+    """
+
+    def __init__(self, path: str, mbits: int = 512, k: int = 4):
+        self.m = mbits * 1024 * 1024          # bits
+        self.k = k
+        self.path = path
+        self.count = 0
+        nbytes = self.m // 8
+        exists = os.path.exists(path) and os.path.getsize(path) == nbytes
+        self._file = open(path, "r+b" if exists else "w+b")
+        if not exists:
+            self._file.truncate(nbytes)
+            self._file.flush()
+            os.fsync(self._file.fileno())
+        self.mm = mmap.mmap(self._file.fileno(), 0)
+        self._lock = threading.Lock()
+        if exists:
+            # Recover an approximate count from the bits on disk.
+            meta = path + ".count"
+            try:
+                with open(meta, encoding="ascii") as f:
+                    self.count = int(f.read().strip())
+            except (OSError, ValueError):
+                pass
+
+    def _positions(self, url: str):
+        digest = hashlib.blake2b(url.encode("utf-8"),
+                                 digest_size=16).digest()
+        h1 = int.from_bytes(digest[:8], "big")
+        h2 = int.from_bytes(digest[8:], "big") | 1   # must stay non-zero
+        for i in range(self.k):
+            yield (h1 + i * h2) % self.m
+
+    def is_seen(self, url: str) -> bool:
+        mm = self.mm
+        return all(
+            mm[p >> 3] & (1 << (p & 7)) for p in self._positions(url))
+
+    def _set(self, url: str) -> bool:
+        """Set all bits; returns False if they were already set."""
+        new = False
+        for p in self._positions(url):
+            byte = self.mm[p >> 3]
+            bit = 1 << (p & 7)
+            if not byte & bit:
+                self.mm[p >> 3] = byte | bit
+                new = True
+        return new
+
+    def claim(self, url: str) -> bool:
+        with self._lock:
+            if self.is_seen(url):
+                return False
+            self._set(url)
+            self.count += 1
+            return True
+
+    def mark_seen(self, url: str) -> None:
+        with self._lock:
+            if self._set(url):
+                self.count += 1
+
+    def flush(self) -> None:
+        self.mm.flush()
+        tmp = self.path + ".count.tmp"
+        try:
+            with open(tmp, "w", encoding="ascii") as f:
+                f.write(str(self.count))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path + ".count")
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        try:
+            self.flush()
+            self.mm.close()
+        finally:
+            self._file.close()
+
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS seen (
@@ -148,6 +253,9 @@ CREATE TABLE IF NOT EXISTS inflight (
     url       TEXT NOT NULL,
     depth     INTEGER NOT NULL,
     claimed_at REAL NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS unclaimed (
+    hash INTEGER PRIMARY KEY
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS domains (
     domain      TEXT PRIMARY KEY,
@@ -173,7 +281,7 @@ class Storage:
     database half-written.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, bloom_mbits: int = 0):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         # check_same_thread=False: fetch calls may run in asyncio worker
         # threads; all access below is serialized by _lock anyway.
@@ -183,6 +291,11 @@ class Storage:
         self._lock = threading.RLock()
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA)
+        self.bloom: Optional[BloomSeen] = None
+        if bloom_mbits:
+            bits_path = os.path.join(
+                os.path.dirname(os.path.abspath(path)), "bloom.bits")
+            self.bloom = BloomSeen(bits_path, mbits=bloom_mbits)
 
     def close(self) -> None:
         try:
@@ -190,10 +303,19 @@ class Storage:
         except sqlite3.Error:
             pass
         self._conn.close()
+        if self.bloom:
+            self.bloom.close()
+
+    def flush(self) -> None:
+        """Persist volatile state (bloom bits) without closing."""
+        if self.bloom:
+            self.bloom.flush()
 
     # -- seen set ----------------------------------------------------------
 
     def is_seen(self, url: str) -> bool:
+        if self.bloom:
+            return self.bloom.is_seen(url)
         with self._lock:
             row = self._conn.execute(
                 "SELECT 1 FROM seen WHERE hash = ?", (url_hash(url),)
@@ -201,6 +323,9 @@ class Storage:
         return row is not None
 
     def mark_seen(self, url: str) -> None:
+        if self.bloom:
+            self.bloom.mark_seen(url)
+            return
         with self._lock:
             self._conn.execute(
                 "INSERT OR IGNORE INTO seen(hash) VALUES (?)",
@@ -213,11 +338,18 @@ class Storage:
         Returns True exactly once per URL (per run or across restarts),
         so two workers can never fetch the same page concurrently.
         """
+        h = url_hash(url)
         with self._lock:
+            if self.bloom:
+                # A requeued URL lands in `unclaimed` (bloom bits can't be
+                # unset); consume that ticket, else test-and-set the bits.
+                cur = self._conn.execute(
+                    "DELETE FROM unclaimed WHERE hash = ?", (h,))
+                if cur.rowcount:
+                    return True
+                return self.bloom.claim(url)
             cur = self._conn.execute(
-                "INSERT OR IGNORE INTO seen(hash) VALUES (?)",
-                (url_hash(url),),
-            )
+                "INSERT OR IGNORE INTO seen(hash) VALUES (?)", (h,))
         return cur.rowcount > 0
 
     def requeue(self, url: str, depth: int, next_fetch: float) -> None:
@@ -226,7 +358,13 @@ class Storage:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 h = url_hash(url)
-                self._conn.execute("DELETE FROM seen WHERE hash = ?", (h,))
+                if self.bloom:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO unclaimed(hash)"
+                        " VALUES (?)", (h,))
+                else:
+                    self._conn.execute(
+                        "DELETE FROM seen WHERE hash = ?", (h,))
                 self._conn.execute(
                     "DELETE FROM inflight WHERE url_hash = ?", (h,))
                 self._conn.execute(
@@ -258,8 +396,13 @@ class Storage:
                 rows = self._conn.execute(
                     "SELECT url_hash, url, depth FROM inflight").fetchall()
                 for h, url, depth in rows:
-                    self._conn.execute(
-                        "DELETE FROM seen WHERE hash = ?", (h,))
+                    if self.bloom:
+                        self._conn.execute(
+                            "INSERT OR REPLACE INTO unclaimed(hash)"
+                            " VALUES (?)", (h,))
+                    else:
+                        self._conn.execute(
+                            "DELETE FROM seen WHERE hash = ?", (h,))
                     self._conn.execute(
                         "INSERT OR IGNORE INTO queue(url_hash, url, depth,"
                         " priority, next_fetch) VALUES (?, ?, ?, 0, 0)",
@@ -318,6 +461,8 @@ class Storage:
                 "SELECT COUNT(*) FROM queue").fetchone()[0]
 
     def seen_size(self) -> int:
+        if self.bloom:
+            return self.bloom.count
         with self._lock:
             return self._conn.execute(
                 "SELECT COUNT(*) FROM seen").fetchone()[0]
@@ -512,22 +657,28 @@ class Fetcher:
 # --------------------------------------------------------------------------
 
 class LinkExtractor(HTMLParser):
-    """Collects <a href> links from an HTML document."""
+    """Collects <a href> links and <link rel=canonical> from a document."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.links: list[str] = []
+        self.canonical: Optional[str] = None
 
     def handle_starttag(self, tag: str, attrs) -> None:
-        if tag != "a":
-            return
-        for name, value in attrs:
-            if name == "href" and value:
-                self.links.append(value)
-                return
+        attrs = dict(attrs)
+        if tag == "a":
+            href = attrs.get("href")
+            if href:
+                self.links.append(href)
+        elif tag == "link":
+            rel = (attrs.get("rel") or "").lower()
+            if "canonical" in rel and attrs.get("href"):
+                self.canonical = attrs["href"]
 
 
-def extract_links(html: str, base_url: str) -> list[str]:
+def extract_links(html: str, base_url: str) -> tuple[list[str],
+                                                     Optional[str]]:
+    """Returns (cleaned absolute outlinks, canonical URL or None)."""
     parser = LinkExtractor()
     try:
         parser.feed(html)
@@ -540,7 +691,11 @@ def extract_links(html: str, base_url: str) -> list[str]:
         cleaned = clean_url(abs_url)
         if cleaned:
             out.append(cleaned)
-    return out
+    canonical = None
+    if parser.canonical:
+        canonical = clean_url(urllib.parse.urljoin(base_url,
+                                                   parser.canonical))
+    return out, canonical
 
 
 # --------------------------------------------------------------------------
@@ -713,7 +868,9 @@ class Crawler:
         self.args = args
         self.data_dir = args.data_dir
         os.makedirs(self.data_dir, exist_ok=True)
-        self.storage = Storage(os.path.join(self.data_dir, "botaghota.db"))
+        self.storage = Storage(
+            os.path.join(self.data_dir, "botaghota.db"),
+            bloom_mbits=args.bloom_mbits if args.bloom else 0)
         self.fetcher = Fetcher()
         self.robots = RobotsCache(self.fetcher)
         self.polite = Politeness(default_delay=args.delay)
@@ -872,13 +1029,20 @@ class Crawler:
 
         first_crawl = not self.storage.page_known(url)
         self.storage.record_page(url, status, depth)
-        if first_crawl:
-            self.writer.write(url)   # daily files stay duplicate-free
         self.pages_done += 1
         LOG.info("[%d] %s (%s)", self.pages_done, url,
                  asyncio.current_task().get_name())
 
-        for link in extract_links(html, url):
+        links, canonical = extract_links(html, url)
+        out_url = canonical or url
+        if canonical and canonical != url:
+            # The page says this content lives at the canonical URL; mark
+            # it seen so we never fetch the same content twice.
+            self.storage.mark_seen(canonical)
+        if first_crawl:
+            self.writer.write(out_url)   # daily files stay duplicate-free
+
+        for link in links:
             self.enqueue_link(link, depth + 1)
 
     def enqueue_link(self, link: str, depth: int,
@@ -912,6 +1076,7 @@ class Crawler:
         now = time.time()
         if force or now - self._last_state_flush >= STATE_FLUSH_INTERVAL:
             self._last_state_flush = now
+            self.storage.flush()
             write_state(self.state_path, self.snapshot_state())
 
     def checkpoint(self) -> None:
@@ -974,6 +1139,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-sitemap", dest="sitemap", action="store_false",
                    help="Do not fetch sitemap.xml for new domains")
     p.set_defaults(sitemap=True)
+    p.add_argument("--bloom", action="store_true",
+                   help="Use a file-backed Bloom filter for dedup "
+                        "(constant memory; small false-positive rate)")
+    p.add_argument("--bloom-mbits", type=int, default=512,
+                   help="Bloom filter size in mebibits, used with --bloom "
+                        "(default: 512 = 64 MiB file, ~100M URLs)")
     p.add_argument("--stats", action="store_true",
                    help="Print crawl statistics and exit")
     p.add_argument("-v", "--verbose", action="store_true",

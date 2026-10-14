@@ -166,6 +166,35 @@ def test_recrawl_after_interval(site, tmp_path):
     assert len(urls) == len(set(urls))
 
 
+def test_canonical_dedup(site, tmp_path):
+    """A page's rel=canonical is recorded, not refetched."""
+    site.pages["/"] = page(links=["/a?utm_source=x"])
+    site.pages["/a?utm_source=x"] = (
+        200, "text/html",
+        '<html><head><link rel="canonical" href="/a">'
+        "<title>a</title></head><body></body></html>")
+    site.pages["/a"] = page()
+    run_crawler(tmp_path, [site.base_url + "/"], seconds=3.0)
+    urls = set(all_crawled_urls(tmp_path))
+    # The canonical URL is written; the parameterized one is not.
+    assert site.base_url + "/a" in urls
+    assert site.base_url + "/a?utm_source=x" not in urls
+
+
+def test_bloom_mode_crawls_and_persists(site, tmp_path):
+    """--bloom dedups across restarts with constant memory."""
+    build_site(site, n=4)
+    args = ("--bloom", "--bloom-mbits", "1")
+    run_crawler(tmp_path, [site.base_url + "/"], seconds=3.0,
+                extra_args=args)
+    run_crawler(tmp_path, [site.base_url + "/"], seconds=2.0,
+                extra_args=args)
+    urls = all_crawled_urls(tmp_path)
+    assert len(urls) == len(set(urls))
+    assert site.base_url + "/p1.html" in set(urls)
+    assert (tmp_path / "bloom.bits").stat().st_size == (1024 * 1024) // 8
+
+
 def test_stats_runs(site, tmp_path, capsys):
     build_site(site, n=3)
     run_crawler(tmp_path, [site.base_url + "/"], seconds=2.0)
