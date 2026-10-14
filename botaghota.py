@@ -21,6 +21,7 @@ Design rules (non-negotiable):
 from __future__ import annotations
 
 import argparse
+import asyncio
 import gzip
 import hashlib
 import json
@@ -141,6 +142,12 @@ CREATE TABLE IF NOT EXISTS queue (
     next_fetch REAL NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_queue_pop ON queue(next_fetch, priority);
+CREATE TABLE IF NOT EXISTS inflight (
+    url_hash  INTEGER PRIMARY KEY,
+    url       TEXT NOT NULL,
+    depth     INTEGER NOT NULL,
+    claimed_at REAL NOT NULL
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS pages (
     url_hash   INTEGER PRIMARY KEY,
     url        TEXT NOT NULL,
@@ -162,8 +169,8 @@ class Storage:
 
     def __init__(self, path: str):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        # check_same_thread=False: the crawler loop may run in a worker
-        # thread; all access below is serialized by _lock anyway.
+        # check_same_thread=False: fetch calls may run in asyncio worker
+        # threads; all access below is serialized by _lock anyway.
         self._conn = sqlite3.connect(path, timeout=30.0,
                                      isolation_level=None,
                                      check_same_thread=False)
@@ -194,6 +201,71 @@ class Storage:
                 (url_hash(url),),
             )
 
+    def claim(self, url: str) -> bool:
+        """Atomically claim a URL for crawling.
+
+        Returns True exactly once per URL (per run or across restarts),
+        so two workers can never fetch the same page concurrently.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO seen(hash) VALUES (?)",
+                (url_hash(url),),
+            )
+        return cur.rowcount > 0
+
+    def requeue(self, url: str, depth: int, next_fetch: float) -> None:
+        """Un-claim a URL and put it back on the frontier, atomically."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                h = url_hash(url)
+                self._conn.execute("DELETE FROM seen WHERE hash = ?", (h,))
+                self._conn.execute(
+                    "DELETE FROM inflight WHERE url_hash = ?", (h,))
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO queue(url_hash, url, depth,"
+                    " priority, next_fetch) VALUES (?, ?, ?, 0, ?)",
+                    (h, url, depth, next_fetch),
+                )
+                self._conn.execute("COMMIT")
+            except sqlite3.Error:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def ack(self, url: str) -> None:
+        """Mark a dequeued URL as fully handled (removes inflight row)."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM inflight WHERE url_hash = ?", (url_hash(url),))
+
+    def recover_inflight(self) -> int:
+        """Move URLs claimed by a killed run back to the queue.
+
+        Called once at startup: anything left in inflight was being
+        fetched when the process died, so it was neither recorded nor
+        re-queued. Returns the number recovered.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._conn.execute(
+                    "SELECT url_hash, url, depth FROM inflight").fetchall()
+                for h, url, depth in rows:
+                    self._conn.execute(
+                        "DELETE FROM seen WHERE hash = ?", (h,))
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO queue(url_hash, url, depth,"
+                        " priority, next_fetch) VALUES (?, ?, ?, 0, 0)",
+                        (h, url, depth),
+                    )
+                self._conn.execute("DELETE FROM inflight")
+                self._conn.execute("COMMIT")
+            except sqlite3.Error:
+                self._conn.execute("ROLLBACK")
+                raise
+        return len(rows)
+
     # -- frontier ----------------------------------------------------------
 
     def enqueue(self, url: str, depth: int, priority: float = 0.0,
@@ -222,6 +294,11 @@ class Storage:
                 if row:
                     self._conn.execute(
                         "DELETE FROM queue WHERE url_hash = ?", (row[0],)
+                    )
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO inflight(url_hash, url,"
+                        " depth, claimed_at) VALUES (?, ?, ?, ?)",
+                        (row[0], row[1], row[2], now),
                     )
                 self._conn.execute("COMMIT")
             except sqlite3.Error:
@@ -258,6 +335,13 @@ class Storage:
                 (limit,),
             ).fetchall()
 
+    def domain_count(self, domain: str) -> int:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM pages WHERE domain = ?",
+                (domain,),
+            ).fetchone()[0]
+
 
 # --------------------------------------------------------------------------
 # robots.txt
@@ -274,6 +358,7 @@ class RobotsCache:
     def __init__(self, fetcher: "Fetcher"):
         self._fetcher = fetcher
         self._cache: dict[str, tuple] = {}   # host -> (parser_or_None, expiry)
+        self._lock = threading.Lock()
 
     def _load(self, host: str, scheme: str) -> None:
         url = f"{scheme}://{host}/robots.txt"
@@ -286,18 +371,21 @@ class RobotsCache:
         elif status is not None and 400 <= status < 500:
             self._cache[host] = (None, now + ROBOTS_TTL)  # no rules: allow
         else:
-            rp.parse([])   # empty ruleset => disallow nothing, but we deny below
-            self._cache[host] = (rp, now + ROBOTS_DENY_TTL)
+            rp.parse([])   # unreachable: robots fetch failed
             self._cache[host] = ("DENY", now + ROBOTS_DENY_TTL)
 
-    def can_fetch(self, url: str) -> bool:
+    def _entry(self, url: str):
         parts = urllib.parse.urlsplit(url)
         host = parts.netloc
-        entry = self._cache.get(host)
-        if entry is None or entry[1] < time.time():
-            self._load(host, parts.scheme)
-            entry = self._cache[host]
-        rp = entry[0]
+        with self._lock:
+            entry = self._cache.get(host)
+            if entry is None or entry[1] < time.time():
+                self._load(host, parts.scheme)
+                entry = self._cache[host]
+        return entry[0]
+
+    def can_fetch(self, url: str) -> bool:
+        rp = self._entry(url)
         if rp is None:
             return True
         if rp == "DENY":
@@ -305,13 +393,7 @@ class RobotsCache:
         return rp.can_fetch(USER_AGENT, url)
 
     def crawl_delay(self, url: str) -> Optional[float]:
-        parts = urllib.parse.urlsplit(url)
-        host = parts.netloc
-        entry = self._cache.get(host)
-        if entry is None or entry[1] < time.time():
-            self._load(host, parts.scheme)
-            entry = self._cache[host]
-        rp = entry[0]
+        rp = self._entry(url)
         if rp is None or rp == "DENY":
             return None
         delay = rp.crawl_delay(USER_AGENT)
@@ -327,9 +409,17 @@ class Fetcher:
 
     def __init__(self, timeout: float = DEFAULT_TIMEOUT):
         self.timeout = timeout
-        self._opener = urllib.request.build_opener(
-            urllib.request.HTTPRedirectHandler()
-        )
+        # One opener per thread: OpenerDirector is not guaranteed
+        # thread-safe and asyncio workers fetch via asyncio.to_thread.
+        self._local = threading.local()
+
+    def _opener(self):
+        opener = getattr(self._local, "opener", None)
+        if opener is None:
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPRedirectHandler())
+            self._local.opener = opener
+        return opener
 
     def fetch_raw(self, url: str, cap: int = MAX_BODY_BYTES) -> tuple:
         """Fetch a URL. Returns (status, body_bytes).
@@ -345,7 +435,7 @@ class Fetcher:
             }
         )
         try:
-            with self._opener.open(req, timeout=self.timeout) as resp:
+            with self._opener().open(req, timeout=self.timeout) as resp:
                 data = resp.read(cap + 1)[:cap]
                 if resp.headers.get("Content-Encoding") == "gzip":
                     try:
@@ -524,6 +614,7 @@ class Crawler:
         self._stop = threading.Event()
         self._last_state_flush = 0.0
         self._closed = False
+        self._seed_urls: list[str] = []
 
     # -- lifecycle --------------------------------------------------------
 
@@ -532,30 +623,61 @@ class Crawler:
         self._stop.set()
 
     def run(self, seeds: list[str]) -> None:
+        """Entry point: run the async crawl loop with --workers coroutines."""
+        try:
+            asyncio.run(self._run_async(seeds))
+        finally:
+            self.checkpoint()
+
+    async def _run_async(self, seeds: list[str]) -> None:
+        recovered = self.storage.recover_inflight()
+        if recovered:
+            LOG.warning("Recovered %d URL(s) lost mid-flight by a previous"
+                        " unclean shutdown.", recovered)
         for seed in seeds:
             cleaned = clean_url(seed)
             if cleaned is None:
-                LOG.error("Seed %r is not a valid http(s) URL; skipping", seed)
+                LOG.error("Seed %r is not a valid http(s) URL; skipping",
+                          seed)
                 continue
+            self._seed_urls.append(cleaned)
             self.storage.enqueue(cleaned, depth=0, priority=1.0)
-        limit = self.args.limit
+        workers = [
+            asyncio.create_task(self._worker(i), name=f"w{i}")
+            for i in range(max(1, self.args.workers))
+        ]
+        flusher = asyncio.create_task(self._flusher())
+        await asyncio.gather(*workers)
+        flusher.cancel()
+        try:
+            await flusher
+        except asyncio.CancelledError:
+            pass
+
+    async def _flusher(self) -> None:
         while not self._stop.is_set():
+            self.maybe_flush_state()
+            await asyncio.sleep(STATE_FLUSH_INTERVAL)
+
+    def _reseed(self, seeds_seen: list[str]) -> int:
+        n = 0
+        for seed in seeds_seen:
+            if self.storage.enqueue(seed, depth=0, priority=1.0):
+                n += 1
+        return n
+
+    async def _worker(self, worker_id: int) -> None:
+        while not self._stop.is_set():
+            if self.args.limit and self.pages_done >= self.args.limit:
+                LOG.info("Reached --limit %d; stopping.", self.args.limit)
+                self._stop.set()
+                break
             item = self.storage.dequeue()
             if item is None:
                 if self.storage.queue_size() == 0:
-                    LOG.info("Queue empty; re-seeding.")
-                    for seed in seeds:
-                        cleaned = clean_url(seed)
-                        if cleaned:
-                            self.storage.enqueue(cleaned, depth=0,
-                                                 priority=1.0,
-                                                 next_fetch=time.time())
-                    time.sleep(1.0)
-                    if self.storage.queue_size() == 0:
-                        time.sleep(5.0)
-                    continue
-                # Everything queued is waiting on rate limits/backoff.
-                self._sleep_interruptibly(0.5)
+                    n = self._reseed(self._seed_urls)
+                    LOG.info("Queue empty; re-seeded %d URL(s).", n)
+                await asyncio.sleep(0.5)
                 continue
             url, depth = item
             host = host_of(url)
@@ -563,68 +685,74 @@ class Crawler:
             if wait > 0:
                 self.storage.enqueue(url, depth=depth,
                                      next_fetch=time.time() + wait)
-                self._sleep_interruptibly(min(wait, 1.0))
+                await asyncio.sleep(min(wait, 1.0))
                 continue
-            self.crawl_page(url, depth)
-            if limit and self.pages_done >= limit:
-                LOG.info("Reached --limit %d; stopping.", limit)
-                break
-            self.maybe_flush_state()
-        self.checkpoint()
-
-    def _sleep_interruptibly(self, seconds: float) -> None:
-        self._stop.wait(seconds)
+            await self.crawl_page(url, depth)
 
     # -- per-page work -----------------------------------------------------
 
-    def crawl_page(self, url: str, depth: int) -> None:
-        if self.storage.is_seen(url):
-            return
+    async def crawl_page(self, url: str, depth: int) -> None:
+        try:
+            if not self.storage.claim(url):
+                return   # already seen or claimed by another worker
+            await self._crawl_page_claimed(url, depth)
+        finally:
+            self.storage.ack(url)
+
+    async def _crawl_page_claimed(self, url: str, depth: int) -> None:
         if looks_like_trap(url, self.args.max_depth, depth):
             self.errors["trap"] += 1
-            self.storage.mark_seen(url)
             return
-        if not self.robots.can_fetch(url):
+        domain = domain_of(url)
+        cap = self.args.domain_cap
+        if cap and self.storage.domain_count(domain) >= cap:
+            self.errors["domain_cap"] += 1
+            return
+        allowed = await asyncio.to_thread(self.robots.can_fetch, url)
+        if not allowed:
             self.errors["robots_denied"] += 1
             LOG.debug("robots.txt denies %s", url)
-            self.storage.mark_seen(url)
             return
-        delay = self.robots.crawl_delay(url)
+        delay = await asyncio.to_thread(self.robots.crawl_delay, url)
         host = host_of(url)
-        status, html = self.fetcher.fetch(url)
+        status, html = await asyncio.to_thread(self.fetcher.fetch, url)
         if status is None:
             self.errors["network"] += 1
             # A dropped connection is URL-level trouble, not a signal the
-            # host wants slower crawling — mark seen, count, move on.
-            self.storage.mark_seen(url)
+            # host wants slower crawling — count it, move on.
             return
         if status == 429 or status >= 500:
             key = f"http_{status}"
             self.errors[key] += 1
             self.polite.note_failure(host)
-            # Re-queue so the page is not lost, after backoff.
-            self.storage.enqueue(url, depth=depth,
+            # Put it back so the page is not lost, after backoff. The
+            # claim is released atomically with the re-enqueue.
+            self.storage.requeue(url, depth,
                                  next_fetch=time.time() + BACKOFF_BASE)
             return
         self.polite.note_fetched(host, delay)
         if status != 200 or html is None:
             self.errors[f"http_{status}"] += 1
-            self.storage.mark_seen(url)
             self.storage.record_page(url, status, depth)
             return
 
-        self.storage.mark_seen(url)
         self.storage.record_page(url, status, depth)
         self.writer.write(url)
         self.pages_done += 1
-        LOG.info("[%d] %s", self.pages_done, url)
+        LOG.info("[%d] %s (%s)", self.pages_done, url,
+                 asyncio.current_task().get_name())
 
         for link in extract_links(html, url):
-            if self.storage.is_seen(link):
-                continue
-            if looks_like_trap(link, self.args.max_depth, depth + 1):
-                continue
-            self.storage.enqueue(link, depth=depth + 1)
+            self.enqueue_link(link, depth + 1)
+
+    def enqueue_link(self, link: str, depth: int,
+                     priority: float = 0.0) -> bool:
+        """Dedup + trap-check + enqueue an outgoing link."""
+        if self.storage.is_seen(link):
+            return False
+        if looks_like_trap(link, self.args.max_depth, depth):
+            return False
+        return self.storage.enqueue(link, depth=depth, priority=priority)
 
     # -- state -------------------------------------------------------------
 
@@ -698,6 +826,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Max pages per domain (0 = unlimited)")
     p.add_argument("--limit", type=int, default=0,
                    help="Stop after N pages (0 = run forever)")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Concurrent fetch workers (default: 1)")
     p.add_argument("--stats", action="store_true",
                    help="Print crawl statistics and exit")
     p.add_argument("-v", "--verbose", action="store_true",
