@@ -123,6 +123,8 @@ def domain_of(url: str) -> str:
     """
     host = host_of(url).split(":", 1)[0]
     labels = host.split(".")
+    if all(lbl.isdigit() for lbl in labels):
+        return host   # IP literal: the whole address is the "domain"
     return ".".join(labels[-2:]) if len(labels) >= 2 else host
 
 
