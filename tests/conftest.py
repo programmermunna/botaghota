@@ -3,15 +3,15 @@
 import os
 import sys
 import threading
-import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import botaghota  # noqa: E402
+import botaghota
 
 
 def make_args(*argv):
@@ -21,9 +21,9 @@ def make_args(*argv):
 class SiteHandler(BaseHTTPRequestHandler):
     """Serves a dict of pages; counts every request path."""
 
-    pages: dict = {}
+    pages: ClassVar[dict] = {}
     robots: str = "User-agent: *\nAllow: /\n"
-    hits: Counter = Counter()
+    hits: ClassVar[Counter] = Counter()
     sitemap: str = ""
 
     def do_GET(self):
@@ -70,7 +70,7 @@ def page(links=(), title="t", body=""):
     anchors = "".join(f'<a href="{l}">x</a>' for l in links)
     return (200, "text/html",
             f"<html><head><title>{title}</title></head>"
-            f"<body>{anchors}{body}</body></html>")
+            + f"<body>{anchors}{body}</body></html>")
 
 
 @pytest.fixture

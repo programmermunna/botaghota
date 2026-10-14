@@ -6,8 +6,9 @@ import subprocess
 import sys
 import time
 
-import botaghota
 from conftest import all_crawled_urls, page, run_crawler
+
+import botaghota
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -172,7 +173,7 @@ def test_canonical_dedup(site, tmp_path):
     site.pages["/a?utm_source=x"] = (
         200, "text/html",
         '<html><head><link rel="canonical" href="/a">'
-        "<title>a</title></head><body></body></html>")
+        + "<title>a</title></head><body></body></html>")
     site.pages["/a"] = page()
     run_crawler(tmp_path, [site.base_url + "/"], seconds=3.0)
     urls = set(all_crawled_urls(tmp_path))
@@ -199,8 +200,8 @@ def test_extract_writes_jsonl(site, tmp_path):
     import json as _json
     site.pages["/"] = (200, "text/html",
                        '<html lang="en"><head><title>Home</title>'
-                       '<meta name="description" content="the home page">'
-                       "</head><body></body></html>")
+                       + '<meta name="description" content="the home page">'
+                       + "</head><body></body></html>")
     run_crawler(tmp_path, [site.base_url + "/"], seconds=2.0,
                 extra_args=("--extract",))
     out = list((tmp_path / "extracted").glob("*.jsonl"))
@@ -242,3 +243,35 @@ def test_stats_runs(site, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "queue size" in out
     assert "pages" in out
+
+
+def test_allow_deny_domains(site, tmp_path):
+    site.pages["/"] = page(links=["/ok.html", "http://other.test/x",
+                                  "http://127.0.0.1:1/blocked"])
+    site.pages["/ok.html"] = page()
+    run_crawler(tmp_path, [site.base_url + "/"], seconds=3.0,
+                extra_args=("--allow-domain", "127.0.0.1",
+                            "--deny-domain", "nope.test"))
+    urls = set(all_crawled_urls(tmp_path))
+    assert site.base_url + "/ok.html" in urls
+    assert not any("other.test" in u for u in urls)
+
+
+def test_config_toml(tmp_path, site):
+    cfg = tmp_path / "my.toml"
+    cfg.write_text('delay = 0.01\nworkers = 2\nmax_depth = 4\n'
+                   'deny_domains = ["evil.test"]\nverbose = true\n')
+    args = botaghota.parse_args(
+        ["--config", str(cfg), site.base_url + "/", "--workers", "3"])
+    assert args.workers == 3          # CLI beats config
+    assert args.max_depth == 4        # config beats built-in default
+    assert args.deny_domains == ["evil.test"]
+    assert args.verbose is True
+
+
+def test_mini_toml_parser():
+    cfg = botaghota.parse_config_text(
+        '# comment\nworkers = 4\ndelay = 0.5\nbloom = true\n'
+        'name = "x" # inline\nextract = ["a", "b"]\n[section]\nignored=1\n')
+    assert cfg == {"workers": 4, "delay": 0.5, "bloom": True,
+                   "name": "x", "extract": ["a", "b"]}

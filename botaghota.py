@@ -26,8 +26,10 @@ import gzip
 import hashlib
 import importlib
 import importlib.util
+import itertools
 import json
 import logging
+import logging.handlers
 import mmap
 import os
 import signal
@@ -43,7 +45,6 @@ import urllib.robotparser
 import xml.etree.ElementTree
 from collections import defaultdict
 from html.parser import HTMLParser
-from typing import Optional
 
 __version__ = "0.1.0"
 
@@ -57,6 +58,7 @@ ROBOTS_DENY_TTL = 1800.0       # how long a 5xx robots.txt blocks a host
 BACKOFF_BASE = 30.0            # first backoff after 429/5xx
 BACKOFF_MAX = 3600.0           # cap for exponential backoff
 STATE_FLUSH_INTERVAL = 30.0    # seconds between state.json checkpoints
+RESEED_INTERVAL = 60.0         # min seconds between idle re-seed attempts
 
 LOG = logging.getLogger("botaghota")
 
@@ -71,7 +73,7 @@ def url_hash(url: str) -> int:
     return int.from_bytes(raw, "big", signed=True)
 
 
-def clean_url(url: str) -> Optional[str]:
+def clean_url(url: str) -> str | None:
     """Normalize a URL for dedup; return None if it is not fetchable http(s)."""
     url = url.strip()
     if not url or len(url) > MAX_URL_LENGTH:
@@ -134,13 +136,11 @@ def looks_like_trap(url: str, max_depth: int, depth: int) -> bool:
     path_segments = [s for s in parts.path.split("/") if s]
     # Repeating the same segment over and over (/a/a/a/a/...) is a trap.
     run = 1
-    for prev, cur in zip(path_segments, path_segments[1:]):
+    for prev, cur in itertools.pairwise(path_segments):
         run = run + 1 if cur == prev else 1
         if run >= 4:
             return True
-    if len(parts.query.split("&")) > 10 if parts.query else False:
-        return True
-    return False
+    return bool(parts.query) and len(parts.query.split("&")) > 10
 
 
 # --------------------------------------------------------------------------
@@ -164,7 +164,7 @@ class BloomSeen:
         self.count = 0
         nbytes = self.m // 8
         exists = os.path.exists(path) and os.path.getsize(path) == nbytes
-        self._file = open(path, "r+b" if exists else "w+b")
+        self._file = open(path, "r+b" if exists else "w+b")  # noqa: SIM115 - held for the lifetime of the filter
         if not exists:
             self._file.truncate(nbytes)
             self._file.flush()
@@ -293,7 +293,7 @@ class Storage:
         self._lock = threading.RLock()
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(SCHEMA)
-        self.bloom: Optional[BloomSeen] = None
+        self.bloom: BloomSeen | None = None
         if bloom_mbits:
             bits_path = os.path.join(
                 os.path.dirname(os.path.abspath(path)), "bloom.bits")
@@ -429,7 +429,7 @@ class Storage:
             )
         return cur.rowcount > 0
 
-    def dequeue(self, now: Optional[float] = None) -> Optional[tuple]:
+    def dequeue(self, now: float | None = None) -> tuple | None:
         """Pop the highest-priority due URL, atomically."""
         now = time.time() if now is None else now
         with self._lock:
@@ -471,7 +471,7 @@ class Storage:
 
     # -- page records ------------------------------------------------------
 
-    def record_page(self, url: str, status: Optional[int], depth: int) -> None:
+    def record_page(self, url: str, status: int | None, depth: int) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO pages(url_hash, url, fetched_at,"
@@ -536,7 +536,7 @@ class Storage:
             )
         return cur.rowcount > 0
 
-    def last_fetched(self, url: str) -> Optional[float]:
+    def last_fetched(self, url: str) -> float | None:
         with self._lock:
             row = self._conn.execute(
                 "SELECT fetched_at FROM pages WHERE url_hash = ?",
@@ -564,7 +564,7 @@ class RobotsCache:
     disallowed for ROBOTS_DENY_TTL seconds rather than hammering it.
     """
 
-    def __init__(self, fetcher: "Fetcher"):
+    def __init__(self, fetcher: Fetcher):
         self._fetcher = fetcher
         self._cache: dict[str, tuple] = {}   # host -> (parser_or_None, expiry)
         self._lock = threading.Lock()
@@ -602,7 +602,7 @@ class RobotsCache:
             return False
         return rp.can_fetch(USER_AGENT, url)
 
-    def crawl_delay(self, url: str) -> Optional[float]:
+    def crawl_delay(self, url: str) -> float | None:
         rp = self._entry(url)
         if rp is None or rp == "DENY":
             return None
@@ -683,7 +683,7 @@ class LinkExtractor(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.links: list[str] = []
-        self.canonical: Optional[str] = None
+        self.canonical: str | None = None
 
     def handle_starttag(self, tag: str, attrs) -> None:
         attrs = dict(attrs)
@@ -702,9 +702,9 @@ class PageInfoParser(HTMLParser):
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.title: Optional[str] = None
-        self.description: Optional[str] = None
-        self.lang: Optional[str] = None
+        self.title: str | None = None
+        self.description: str | None = None
+        self.lang: str | None = None
         self._in_title = False
 
     def handle_starttag(self, tag: str, attrs) -> None:
@@ -734,20 +734,20 @@ def default_extract(url: str, html: str) -> dict:
     try:
         parser.feed(html)
         parser.close()
-    except Exception:
+    except Exception:  # noqa: BLE001,S110 - a malformed page must never kill a worker
         pass
     return {"title": parser.title, "description": parser.description,
             "lang": parser.lang}
 
 
 def extract_links(html: str, base_url: str) -> tuple[list[str],
-                                                     Optional[str]]:
+                                                     str | None]:
     """Returns (cleaned absolute outlinks, canonical URL or None)."""
     parser = LinkExtractor()
     try:
         parser.feed(html)
         parser.close()
-    except Exception:  # HTMLParser is forgiving; still never propagate
+    except Exception:  # noqa: BLE001,S110 - HTMLParser is forgiving; still never propagate
         pass
     out = []
     for href in parser.links:
@@ -791,7 +791,7 @@ def parse_sitemap(data: bytes) -> tuple[list[str], list[str]]:
     return pages, children
 
 
-async def discover_sitemap_urls(crawler: "Crawler", page_url: str,
+async def discover_sitemap_urls(crawler: Crawler, page_url: str,
                                 domain: str) -> None:
     """Fetch sitemap(s) for a host once and enqueue the URLs found."""
     parts = urllib.parse.urlsplit(page_url)
@@ -836,7 +836,7 @@ class Politeness:
         self._fail_count: dict[str, int] = defaultdict(int)
         self._lock = threading.Lock()
 
-    def note_fetched(self, host: str, crawl_delay: Optional[float]) -> None:
+    def note_fetched(self, host: str, crawl_delay: float | None) -> None:
         delay = max(self.default_delay, crawl_delay or 0.0)
         with self._lock:
             self._next_at[host] = max(
@@ -865,7 +865,7 @@ class Politeness:
 # --extract plugins
 # --------------------------------------------------------------------------
 
-def load_extractors(specs: Optional[list]) -> list:
+def load_extractors(specs: list | None) -> list:
     """Resolve --extract specs into extract(url, html) -> dict callables.
 
     A spec is 'default' (built-in title/description/lang extractor), a
@@ -902,7 +902,7 @@ def load_extractors(specs: Optional[list]) -> list:
                     raise
         fn = getattr(module, "extract", None)
         if not callable(fn):
-            raise ValueError(
+            raise TypeError(
                 f"--extract plugin {spec!r} must define "
                 "extract(url, html) -> dict")
         extractors.append((spec, fn))
@@ -932,7 +932,7 @@ class DailyLinkWriter:
                 self._file.close()
             self._day = day
             path = os.path.join(self._dir, f"{day}{self._ext}")
-            self._file = open(path, "a", encoding="utf-8", buffering=1)
+            self._file = open(path, "a", encoding="utf-8", buffering=1)  # noqa: SIM115 - held until day rollover or close()
         return self._file
 
     def write(self, url: str) -> None:
@@ -979,6 +979,78 @@ def write_state(path: str, state: dict) -> None:
 
 
 # --------------------------------------------------------------------------
+# config.toml (mini TOML subset parser — core stays dependency-free)
+# --------------------------------------------------------------------------
+
+def _toml_value(raw: str):
+    raw = raw.strip().rstrip(",")
+    if not raw:
+        return None
+    if raw[0] in "\"'" and raw[-1] == raw[0]:
+        return raw[1:-1]
+    if raw.lower() in ("true", "false"):
+        return raw.lower() == "true"
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        return [_toml_value(x) for x in inner.split(",") if x.strip()] \
+            if inner else []
+    try:
+        return int(raw)
+    except ValueError:
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+
+
+def parse_config_text(text: str) -> dict:
+    """Parse the flat subset of TOML botaghota uses.
+
+    Supports `key = value` lines where value is a string, number, bool,
+    or a single-line array of those, plus # comments. [sections] are
+    skipped. Full TOML is parsed via tomllib/tomli when available.
+    """
+    cfg: dict = {}
+    in_section = False
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            # Config is flat: everything under a section header is
+            # ignored (use tomllib-capable Python for real sections).
+            in_section = True
+            continue
+        if in_section:
+            continue
+        key, eq, val = line.partition("=")
+        if eq:
+            cfg[key.strip().replace("-", "_")] = _toml_value(val)
+    return cfg
+
+
+def load_config(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    try:
+        import tomllib  # Python 3.11+
+        return tomllib.loads(text)
+    except ImportError:
+        pass
+    try:
+        import tomli  # optional fallback if the user happens to have it
+        return tomli.loads(text)
+    except ImportError:
+        pass
+    return parse_config_text(text)
+
+
+def _match_domain(host: str, domains: list) -> bool:
+    host = host.split(":", 1)[0].lower()
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+# --------------------------------------------------------------------------
 # Optional local dashboard (stdlib http.server)
 # --------------------------------------------------------------------------
 
@@ -1011,7 +1083,7 @@ go(); setInterval(go, 5000);
 class Dashboard:
     """Tiny stdlib dashboard: GET / HTML, GET /api/state JSON snapshot."""
 
-    def __init__(self, crawler: "Crawler", port: int):
+    def __init__(self, crawler: Crawler, port: int):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
         outer = self
@@ -1073,12 +1145,15 @@ class Crawler:
         self.started_at = time.time()
         self._stop = threading.Event()
         self._last_state_flush = 0.0
+        self._last_reseed = 0.0
         self.extractors = load_extractors(args.extract)
         self.json_writer = (
             DailyLinkWriter(os.path.join(self.data_dir, "extracted"),
                             ext=".jsonl") if self.extractors else None)
         self._closed = False
         self._seed_urls: list[str] = []
+        self.allow_domains = [d.lower() for d in (args.allow_domains or [])]
+        self.deny_domains = [d.lower() for d in (args.deny_domains or [])]
 
     # -- lifecycle --------------------------------------------------------
 
@@ -1103,6 +1178,10 @@ class Crawler:
             if cleaned is None:
                 LOG.error("Seed %r is not a valid http(s) URL; skipping",
                           seed)
+                continue
+            if not self.domain_allowed(cleaned):
+                LOG.warning("Seed %r filtered by allow/deny lists; "
+                            "skipping", cleaned)
                 continue
             self._seed_urls.append(cleaned)
             self.storage.note_domain(domain_of(cleaned))
@@ -1139,9 +1218,7 @@ class Crawler:
     def _reseed(self, seeds: list[str]) -> int:
         n = 0
         for seed in seeds:
-            if self.maybe_recrawl(seed, depth=0):
-                n += 1
-            elif self.storage.enqueue(seed, depth=0, priority=3.0):
+            if self.maybe_recrawl(seed, depth=0) or self.storage.enqueue(seed, depth=0, priority=3.0):
                 n += 1
         return n
 
@@ -1166,9 +1243,13 @@ class Crawler:
                 break
             item = self.storage.dequeue()
             if item is None:
-                if self.storage.queue_size() == 0:
-                    n = self._reseed(self._seed_urls)
-                    LOG.info("Queue empty; re-seeded %d URL(s).", n)
+                if self.storage.queue_size() == 0 and worker_id == 0:
+                    now = time.time()
+                    if now - self._last_reseed >= RESEED_INTERVAL:
+                        self._last_reseed = now
+                        n = self._reseed(self._seed_urls)
+                        if n:
+                            LOG.info("Queue empty; re-seeded %d URL(s).", n)
                 await asyncio.sleep(0.5)
                 continue
             url, depth = item
@@ -1208,7 +1289,7 @@ class Crawler:
         if self.args.sitemap and self.storage.claim_sitemap(domain):
             try:
                 await discover_sitemap_urls(self, url, domain)
-            except Exception as e:   # sitemap trouble never kills a crawl
+            except Exception as e:   # noqa: BLE001 - sitemap trouble never kills a crawl
                 self.errors["sitemap"] += 1
                 LOG.debug("sitemap discovery failed for %s: %s", domain, e)
         delay = await asyncio.to_thread(self.robots.crawl_delay, url)
@@ -1274,7 +1355,7 @@ class Crawler:
                 if isinstance(data, dict):
                     record.update(data)
                 self.json_writer.write_json(record)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - a bad plugin must not crash the crawl
                 self.errors["extract"] += 1
                 LOG.debug("extractor %s failed on %s: %s", name, url, e)
 
@@ -1286,10 +1367,20 @@ class Crawler:
             return False
         if looks_like_trap(link, self.args.max_depth, depth):
             return False
+        if not self.domain_allowed(link):
+            return False
         is_new_domain = self.storage.note_domain(domain_of(link))
         if priority <= 0 and is_new_domain:
             priority = 2.0   # never-before-seen domain: crawl first
         return self.storage.enqueue(link, depth=depth, priority=priority)
+
+    def domain_allowed(self, url: str) -> bool:
+        host = host_of(url)
+        if self.allow_domains and not _match_domain(
+                host, self.allow_domains):
+            return False
+        return not (self.deny_domains and _match_domain(host,
+                                                         self.deny_domains))
 
     # -- state -------------------------------------------------------------
 
@@ -1379,6 +1470,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="Polite, crash-safe, dependency-free web crawler.",
     )
     p.add_argument("seed", nargs="*", help="Seed URL(s) to start crawling from")
+    p.add_argument("--config", metavar="PATH",
+                   help="TOML config file (default: ./config.toml if it "
+                        "exists). CLI flags override config values.")
+    p.add_argument("--allow-domain", dest="allow_domains",
+                   action="append", default=None, metavar="DOMAIN",
+                   help="Only crawl these domains (repeatable; "
+                        "subdomains included)")
+    p.add_argument("--deny-domain", dest="deny_domains",
+                   action="append", default=None, metavar="DOMAIN",
+                   help="Never crawl these domains (repeatable)")
     p.add_argument("--data-dir", default="data",
                    help="Directory for the database, state, and output "
                         "(default: ./data)")
@@ -1425,12 +1526,58 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Optional[list] = None) -> int:
-    args = build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+def parse_args(argv: list | None) -> argparse.Namespace:
+    """Parse CLI args, layered over an optional TOML config file.
+
+    Precedence: built-in defaults < config.toml < CLI flags.
+    """
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    pre_args, _ = pre.parse_known_args(argv)
+    cfg_path = pre_args.config
+    if cfg_path is None and os.path.exists("config.toml"):
+        cfg_path = "config.toml"
+    parser = build_parser()
+    if cfg_path:
+        try:
+            cfg = load_config(cfg_path)
+        except (OSError, ValueError) as e:
+            parser.error(f"cannot read config {cfg_path}: {e}")
+        valid = {a.dest for a in parser._actions}
+        unknown = set(cfg) - valid - {"seed"}
+        if unknown:
+            parser.error(f"unknown config keys in {cfg_path}: "
+                         f"{', '.join(sorted(unknown))}")
+        parser.set_defaults(
+            **{k: v for k, v in cfg.items() if k in valid})
+        args = parser.parse_args(argv)
+        if not args.seed and cfg.get("seed"):
+            seed = cfg["seed"]
+            args.seed = seed if isinstance(seed, list) else [seed]
+    else:
+        args = parser.parse_args(argv)
+    return args
+
+
+def setup_logging(args: argparse.Namespace) -> None:
+    level = logging.DEBUG if args.verbose else logging.INFO
+    fmt = "%(asctime)s %(levelname)s %(message)s"
+    logging.basicConfig(level=level, format=fmt)
+    log_dir = os.path.join(args.data_dir, "logs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            os.path.join(log_dir, "botaghota.log"),
+            maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(fmt))
+        logging.getLogger().addHandler(handler)
+    except OSError as e:
+        LOG.warning("cannot open log file: %s", e)
+
+
+def main(argv: list | None = None) -> int:
+    args = parse_args(argv)
+    setup_logging(args)
     crawler = Crawler(args)
     if args.stats:
         crawler.print_stats()
@@ -1441,6 +1588,11 @@ def main(argv: Optional[list] = None) -> int:
     crawler.fetcher.timeout = args.timeout
 
     def _sig(signum, _frame):
+        if crawler._stop.is_set():
+            # Second signal: give up on graceful shutdown.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
         LOG.info("Received signal %d", signum)
         crawler.request_stop()
 

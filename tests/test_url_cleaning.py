@@ -79,18 +79,18 @@ def test_clean_url_query_order():
 def test_extract_canonical():
     html = ('<link rel="canonical" href="http://example.com/real">'
             '<a href="/b">x</a>')
-    links, canonical = botaghota.extract_links(
+    _links, canonical = botaghota.extract_links(
         html, "http://example.com/a?utm=1")
     assert canonical == "http://example.com/real"
 
 
 def test_parse_sitemap_urlset():
     xml = (
-        '<?xml version="1.0"?>'
-        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-        "<url><loc>http://x/a</loc><lastmod>2026-01-01</lastmod></url>"
-        "<url><loc>http://x/b</loc></url>"
-        "</urlset>").encode()
+        b'<?xml version="1.0"?>'
+        b'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        b"<url><loc>http://x/a</loc><lastmod>2026-01-01</lastmod></url>"
+        b"<url><loc>http://x/b</loc></url>"
+        b"</urlset>")
     pages, children = botaghota.parse_sitemap(xml)
     assert pages == ["http://x/a", "http://x/b"]
     assert children == []
@@ -98,9 +98,9 @@ def test_parse_sitemap_urlset():
 
 def test_parse_sitemap_index():
     xml = (
-        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-        "<sitemap><loc>http://x/sm1.xml</loc></sitemap>"
-        "</sitemapindex>").encode()
+        b'<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        b"<sitemap><loc>http://x/sm1.xml</loc></sitemap>"
+        b"</sitemapindex>")
     pages, children = botaghota.parse_sitemap(xml)
     assert pages == []
     assert children == ["http://x/sm1.xml"]
