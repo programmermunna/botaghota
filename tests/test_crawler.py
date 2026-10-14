@@ -275,3 +275,16 @@ def test_mini_toml_parser():
         'name = "x" # inline\nextract = ["a", "b"]\n[section]\nignored=1\n')
     assert cfg == {"workers": 4, "delay": 0.5, "bloom": True,
                    "name": "x", "extract": ["a", "b"]}
+
+
+def test_ollama_plugin_is_safe_offline(tmp_path):
+    # No Ollama server running: the plugin must answer fast and never raise.
+    spec = os.path.join(os.path.dirname(botaghota.__file__),
+                        "plugins", "ollama_topics.py")
+    extractors = botaghota.load_extractors([spec])
+    _name, fn = extractors[0]
+    out = fn("http://x/", "<html>hello</html>")
+    assert out == {"topic": "unknown"}
+    for _ in range(3):
+        out = fn("http://x/", "<html>hello</html>")
+    assert out == {}   # gave up politely
