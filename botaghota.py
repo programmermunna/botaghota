@@ -1487,7 +1487,8 @@ USAGE
     botaghota --stats              report on an existing data dir, then exit
     botaghota --help               terse argparse option list
 
-CRAWL SCOPES  (--scope local|global, default: local)
+CRAWL SCOPES  (--scope local|global, -l/--local, -g/--global;
+               default: local)
     local   Crawl only the seed's own site. Every unique link on the
             same host (host:port) is followed; off-site links are skipped.
             A full map of one website.
@@ -1566,6 +1567,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="local = crawl only the seed's own host, every "
                         "unique on-site link (default); global = follow "
                         "outlinks to any website")
+    p.add_argument("-l", "--local", dest="scope", action="store_const",
+                   const="local", help="same as --scope local")
+    p.add_argument("-g", "--global", dest="scope", action="store_const",
+                   const="global", help="same as --scope global")
     p.add_argument("--config", metavar="PATH",
                    help="TOML config file (default: ./config.toml if it "
                         "exists). CLI flags override config values.")

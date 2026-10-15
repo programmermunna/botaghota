@@ -56,7 +56,8 @@ python botaghota.py <seed> [<seed>...] [options]
 python botaghota.py help          # full user manual (also: /help)
 
   --scope local|global local = seed's own site only, every unique link
-                       (default); global = follow outlinks to any site
+  -l, --local          (default); global = follow outlinks to any site
+  -g, --global         aliases for --scope local / --scope global
   --data-dir DIR       state + output directory (default: data)
   --workers N          concurrent fetch workers (default: 1)
   --delay SEC          per-host delay between requests (default: 1.0)
