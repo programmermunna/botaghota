@@ -980,6 +980,40 @@ def write_state(path: str, state: dict) -> None:
             pass
 
 
+def write_counts(path: str, state: dict) -> None:
+    """Atomically write a human-readable counts.txt next to state.json."""
+    lines = [
+        "botaghota counts — updated "
+        + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        f"scope            : {state.get('scope')}",
+        f"unique links     : {state.get('seen')}",
+        f"pages crawled    : {state.get('total_pages')}",
+        f"queue            : {state.get('queue')}",
+    ]
+    for status, n in (state.get("status_counts") or {}).items():
+        lines.append(f"status {status:<7} : {n}")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),
+                             suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        dir_fd = os.open(os.path.dirname(os.path.abspath(path)),
+                         os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 # --------------------------------------------------------------------------
 # config.toml (mini TOML subset parser — core stays dependency-free)
 # --------------------------------------------------------------------------
@@ -1154,6 +1188,7 @@ class Crawler:
                             ext=".jsonl") if self.extractors else None)
         self._closed = False
         self._seed_urls: list[str] = []
+        self._seed_hosts: set[str] = set()
         self.allow_domains = [d.lower() for d in (args.allow_domains or [])]
         self.deny_domains = [d.lower() for d in (args.deny_domains or [])]
 
@@ -1175,6 +1210,12 @@ class Crawler:
         if recovered:
             LOG.warning("Recovered %d URL(s) lost mid-flight by a previous"
                         " unclean shutdown.", recovered)
+        # 'local' scope pins the crawl to the seed hosts (scheme-less
+        # host:port). Computed before domain_allowed checks run.
+        self._seed_hosts = {
+            host_of(c) for s in seeds
+            if (c := clean_url(s)) is not None
+        }
         for seed in seeds:
             cleaned = clean_url(seed)
             if cleaned is None:
@@ -1378,6 +1419,9 @@ class Crawler:
 
     def domain_allowed(self, url: str) -> bool:
         host = host_of(url)
+        if self.args.scope == "local" and self._seed_hosts \
+                and host not in self._seed_hosts:
+            return False   # local crawl: never leave the seed's own site
         if self.allow_domains and not _match_domain(
                 host, self.allow_domains):
             return False
@@ -1392,6 +1436,7 @@ class Crawler:
         first, last = self.storage.crawl_timespan()
         span = (last - first) if first and last and last > first else 0
         return {
+            "scope": self.args.scope,
             "pages": self.pages_done,
             "total_pages": total_pages,
             "seen": self.storage.seen_size(),
@@ -1416,7 +1461,9 @@ class Crawler:
         if force or now - self._last_state_flush >= STATE_FLUSH_INTERVAL:
             self._last_state_flush = now
             self.storage.flush()
-            write_state(self.state_path, self.snapshot_state())
+            state = self.snapshot_state()
+            write_state(self.state_path, state)
+            write_counts(os.path.join(self.data_dir, "counts.txt"), state)
 
     def checkpoint(self) -> None:
         if self._closed:
@@ -1432,6 +1479,7 @@ class Crawler:
 
     def print_stats(self) -> None:
         state = self.snapshot_state()
+        print(f"scope                 : {state['scope']}")
         print(f"pages crawled (total) : {state['total_pages']}")
         print(f"pages this session    : {state['pages']}")
         print(f"unique seen           : {state['seen']}")
@@ -1463,6 +1511,85 @@ class Crawler:
 
 
 # --------------------------------------------------------------------------
+# User manual (`botaghota help` / `botaghota /help`)
+# --------------------------------------------------------------------------
+
+MANUAL = """\
+BOTAGHOTA — polite, crash-safe, dependency-free web crawler
+
+USAGE
+    botaghota <seed-url> [more-seeds...] [options]
+    botaghota help                 show this manual
+    botaghota --stats              report on an existing data dir, then exit
+    botaghota --help               terse argparse option list
+
+CRAWL SCOPES  (--scope local|global, -l/--local, -g/--global;
+               default: local)
+    local   Crawl only the seed's own site. Every unique link on the
+            same host (host:port) is followed; off-site links are skipped.
+            A full map of one website.
+    global  The classic mode: follow outlinks to any website, subject to
+            politeness, allow/deny lists, depth and domain caps.
+
+KEY OPTIONS
+    -w, --workers N        concurrent fetch workers (default 1)
+    --delay SECONDS        minimum delay between requests per host (1.0)
+    --max-depth N          max link depth from a seed (10)
+    --domain-cap N         max pages per domain (0 = unlimited)
+    --limit N              stop after N pages this run (0 = forever)
+    --recrawl-hours H      recrawl pages older than H hours (24; 0 = never)
+    --bloom [--bloom-mbits M]  mmap Bloom dedup for 100M+ URLs
+    --no-sitemap           skip sitemap.xml discovery
+    --extract [PLUGIN...]  write per-page metadata to extracted/*.jsonl;
+                           bare flag = built-in title/description/lang,
+                           or plugin .py path / module / plugins/<name>.py
+    --allow-domain D       only these domains (repeatable)
+    --deny-domain D        never these domains (repeatable)
+    --dashboard [PORT]     live stats page on 127.0.0.1 (default 8080)
+    --config FILE          TOML defaults (see config.example.toml)
+    --data-dir DIR         state + output directory (default ./data)
+    -v, --verbose          debug logging
+
+OUTPUT  (everything under --data-dir)
+    crawled_links/YYYY-MM-DD.txt   unique URLs, appended per day
+    extracted/YYYY-MM-DD.jsonl     --extract records
+    counts.txt                     live totals (links, pages, queue)
+    botaghota.sqlite               seen set + frontier queue (atomic, WAL)
+    state.json                     checkpoint, rewritten atomically
+    bloom.bits[.count]             only with --bloom
+    logs/botaghota.log             rotating log (5MB x 3)
+
+STOPPING
+    Ctrl-C once  = graceful stop (finishes the in-flight page, checkpoints)
+    Ctrl-C twice = immediate exit; nothing is lost either way.
+    kill -9 / power loss: the crawl resumes with zero lost or duplicate
+    links on the next start.
+
+POLITENESS
+    Honors robots.txt and Crawl-delay, rate-limits per host, backs off
+    exponentially on 429/5xx, and sends an honest 'botaghota/x.y.z'
+    User-Agent. It never bypasses logins, paywalls, CAPTCHAs, or robots
+    rules.
+
+EXAMPLES
+    botaghota https://mysite.com/                      # full local map
+    botaghota https://mysite.com/ --scope global       # follow the web
+    botaghota https://a/ https://b/ --workers 4 --extract
+    botaghota https://big.site/ --bloom --workers 8 --dashboard
+    botaghota https://x/ --deny-domain ads.example.com
+
+RUN FOREVER
+    Docker   : docker build -t botaghota . && \\
+               docker run -v botaghota-data:/data botaghota <seed>
+    systemd  : see deploy/botaghota.service
+    Windows  : see docs/windows-startup.md
+
+Extract plugins: any module defining `extract(url, html) -> dict`.
+Example shipped: plugins/ollama_topics.py (offline Ollama topic tags).
+"""
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -1470,8 +1597,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="botaghota",
         description="Polite, crash-safe, dependency-free web crawler.",
+        epilog="Run 'botaghota help' for the full user manual.",
     )
     p.add_argument("seed", nargs="*", help="Seed URL(s) to start crawling from")
+    p.add_argument("--scope", choices=("local", "global"), default="local",
+                   help="local = crawl only the seed's own host, every "
+                        "unique on-site link (default); global = follow "
+                        "outlinks to any website")
+    p.add_argument("-l", "--local", dest="scope", action="store_const",
+                   const="local", help="same as --scope local")
+    p.add_argument("-g", "--global", dest="scope", action="store_const",
+                   const="global", help="same as --scope global")
     p.add_argument("--config", metavar="PATH",
                    help="TOML config file (default: ./config.toml if it "
                         "exists). CLI flags override config values.")
@@ -1497,7 +1633,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Max pages per domain (0 = unlimited)")
     p.add_argument("--limit", type=int, default=0,
                    help="Stop after N pages (0 = run forever)")
-    p.add_argument("--workers", type=int, default=1,
+    p.add_argument("-w", "--workers", type=int, default=1,
                    help="Concurrent fetch workers (default: 1)")
     p.add_argument("--recrawl-hours", type=float, default=24.0,
                    help="Recrawl a page after this many hours "
@@ -1578,6 +1714,10 @@ def setup_logging(args: argparse.Namespace) -> None:
 
 
 def main(argv: list | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] and argv[0] in ("help", "/help", "manual", "--manual"):
+        print(MANUAL)
+        return 0
     args = parse_args(argv)
     setup_logging(args)
     crawler = Crawler(args)
