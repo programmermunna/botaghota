@@ -29,6 +29,10 @@ botaghota https://example.com/
 
 ## What it does
 
+- **Two crawl scopes** — `--scope local` (default) maps one website fully:
+  every unique link on the seed's own host is followed, nothing leaves the
+  site. `--scope global` is the classic mode: outlinks to any website are
+  followed, bounded by politeness, allow/deny lists, depth and domain caps.
 - **Polite by design** — robots.txt caching, per-host rate limiting,
   exponential backoff on 429/5xx, honest `botaghota/x.y` User-Agent.
   Never bypasses logins, paywalls, CAPTCHAs, or robots rules.
@@ -49,7 +53,10 @@ botaghota https://example.com/
 
 ```
 python botaghota.py <seed> [<seed>...] [options]
+python botaghota.py help          # full user manual (also: /help)
 
+  --scope local|global local = seed's own site only, every unique link
+                       (default); global = follow outlinks to any site
   --data-dir DIR       state + output directory (default: data)
   --workers N          concurrent fetch workers (default: 1)
   --delay SEC          per-host delay between requests (default: 1.0)

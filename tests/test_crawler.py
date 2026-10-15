@@ -4,9 +4,13 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+from collections import Counter
+from http.server import ThreadingHTTPServer
+from typing import ClassVar
 
-from conftest import all_crawled_urls, page, run_crawler
+from conftest import SiteHandler, all_crawled_urls, page, run_crawler
 
 import botaghota
 
@@ -288,3 +292,60 @@ def test_ollama_plugin_is_safe_offline(tmp_path):
     for _ in range(3):
         out = fn("http://x/", "<html>hello</html>")
     assert out == {}   # gave up politely
+
+
+def _second_site():
+    """A second host (different port) to test cross-site scope."""
+
+    class Handler2(SiteHandler):
+        pages: ClassVar = {}
+        robots = "User-agent: *\nAllow: /\n"
+        sitemap = ""
+        hits: ClassVar = Counter()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler2)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    Handler2.base_url = \
+        f"http://127.0.0.1:{server.server_address[1]}"
+    return Handler2, server
+
+
+def test_scope_local_stays_on_seed_host(site, tmp_path):
+    other, server = _second_site()
+    try:
+        other.pages["/x.html"] = page()
+        site.pages["/"] = page(links=["/in.html", other.base_url + "/x.html"])
+        site.pages["/in.html"] = page()
+        run_crawler(tmp_path, [site.base_url + "/"], seconds=3.0,
+                    extra_args=("--scope", "local"))
+        urls = set(all_crawled_urls(tmp_path))
+        assert site.base_url + "/in.html" in urls
+        assert not any(u.startswith(other.base_url) for u in urls)
+        assert "/x.html" not in other.hits   # never even fetched
+    finally:
+        server.shutdown()
+
+
+def test_scope_global_follows_outlinks(site, tmp_path):
+    other, server = _second_site()
+    try:
+        other.pages["/x.html"] = page()
+        site.pages["/"] = page(links=["/in.html", other.base_url + "/x.html"])
+        site.pages["/in.html"] = page()
+        run_crawler(tmp_path, [site.base_url + "/"], seconds=3.0,
+                    extra_args=("--scope", "global"))
+        urls = set(all_crawled_urls(tmp_path))
+        assert site.base_url + "/in.html" in urls
+        assert other.base_url + "/x.html" in urls
+    finally:
+        server.shutdown()
+
+
+def test_help_command(capsys):
+    for word in ("help", "/help", "manual"):
+        capsys.readouterr()
+        assert botaghota.main([word]) == 0
+        out = capsys.readouterr().out
+        assert "CRAWL SCOPES" in out
+        assert "--scope local" in out or "local" in out

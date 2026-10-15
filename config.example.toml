@@ -3,6 +3,8 @@
 # automatically. Every key maps to the same-named CLI flag; flags win.
 
 # seed = ["https://example.com/"]        # seed URL(s) if not on the CLI
+# scope = "local"                        # local = seed's own site only;
+                                       # global = follow outlinks anywhere
 # data_dir = "data"                      # db, state, logs, output
 # delay = 1.0                            # min seconds between hits per host
 # timeout = 15.0
