@@ -1,0 +1,22 @@
+# botaghota configuration.
+# Copy to config.toml next to where you run the crawler — it is picked up
+# automatically. Every key maps to the same-named CLI flag; flags win.
+
+# seed = ["https://example.com/"]        # seed URL(s) if not on the CLI
+# data_dir = "data"                      # db, state, logs, output
+# delay = 1.0                            # min seconds between hits per host
+# timeout = 15.0
+# max_depth = 10
+# domain_cap = 0                         # max pages per domain (0 = none)
+# workers = 1
+# recrawl_hours = 24.0                   # 0 disables recrawl
+# sitemap = true
+# bloom = false
+# bloom_mbits = 512
+# extract = ["default"]                  # extractor plugin specs
+# dashboard = 8080                       # local dashboard port
+# verbose = false
+
+# Domain allow / deny lists (subdomains included):
+# allow_domains = ["example.com", "wikipedia.org"]
+# deny_domains = ["facebook.com", "twitter.com"]

@@ -1,0 +1,35 @@
+# systemd unit for botaghota.
+# 1. Copy botaghota.py to /opt/botaghota/botaghota.py
+# 2. Create the state directory:  sudo mkdir -p /var/lib/botaghota
+# 3. Copy this file to /etc/systemd/system/botaghota.service
+# 4. sudo systemctl daemon-reload && sudo systemctl enable --now botaghota
+# 5. Logs: journalctl -u botaghota -f   (also /var/lib/botaghota/logs/)
+
+[Unit]
+Description=botaghota polite web crawler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as an unprivileged user, never root.
+User=botaghota
+Group=botaghota
+WorkingDirectory=/var/lib/botaghota
+ExecStart=/usr/bin/python3 /opt/botaghota/botaghota.py \
+    https://example.com/ \
+    --data-dir /var/lib/botaghota \
+    --workers 4
+# Graceful shutdown: SIGTERM -> finish current page, checkpoint, exit.
+TimeoutStopSec=60
+# Restart on crash (state is crash-safe; nothing is lost).
+Restart=on-failure
+RestartSec=10
+# Reasonable hardening for a crawler that needs only the network + its dir.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
