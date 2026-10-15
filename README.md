@@ -18,7 +18,8 @@ python botaghota.py https://example.com/
 ```
 
 That's it — no dependencies, Python 3.10+ only. Links appear in
-`data/crawled_links/YYYY-MM-DD.txt`; state lives in `data/`.
+`data/crawled_links/YYYY-MM-DD.txt`; live totals in
+`data/counts.txt`; state lives in `data/`.
 
 Or install it:
 
@@ -59,7 +60,7 @@ python botaghota.py help          # full user manual (also: /help)
   -l, --local          (default); global = follow outlinks to any site
   -g, --global         aliases for --scope local / --scope global
   --data-dir DIR       state + output directory (default: data)
-  --workers N          concurrent fetch workers (default: 1)
+  -w, --workers N      concurrent fetch workers (default: 1)
   --delay SEC          per-host delay between requests (default: 1.0)
   --max-depth N        frontier depth limit (default: 6)
   --domain-cap N       max pages per registrable domain

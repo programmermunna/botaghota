@@ -349,3 +349,16 @@ def test_help_command(capsys):
         out = capsys.readouterr().out
         assert "CRAWL SCOPES" in out
         assert "--scope local" in out or "local" in out
+
+
+def test_workers_flag_and_counts_file(site, tmp_path):
+    args = botaghota.parse_args(["-w", "3", site.base_url + "/",
+                                 "--data-dir", str(tmp_path)])
+    assert args.workers == 3
+    site.pages["/"] = page(links=["/a.html"])
+    site.pages["/a.html"] = page()
+    run_crawler(tmp_path, [site.base_url + "/"], seconds=2.5,
+                extra_args=("-w", "2"))
+    counts = (tmp_path / "counts.txt").read_text()
+    assert "unique links     : 2" in counts
+    assert "pages crawled    : 2" in counts

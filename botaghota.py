@@ -980,6 +980,40 @@ def write_state(path: str, state: dict) -> None:
             pass
 
 
+def write_counts(path: str, state: dict) -> None:
+    """Atomically write a human-readable counts.txt next to state.json."""
+    lines = [
+        "botaghota counts — updated "
+        + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        f"scope            : {state.get('scope')}",
+        f"unique links     : {state.get('seen')}",
+        f"pages crawled    : {state.get('total_pages')}",
+        f"queue            : {state.get('queue')}",
+    ]
+    for status, n in (state.get("status_counts") or {}).items():
+        lines.append(f"status {status:<7} : {n}")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),
+                             suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        dir_fd = os.open(os.path.dirname(os.path.abspath(path)),
+                         os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 # --------------------------------------------------------------------------
 # config.toml (mini TOML subset parser — core stays dependency-free)
 # --------------------------------------------------------------------------
@@ -1427,7 +1461,9 @@ class Crawler:
         if force or now - self._last_state_flush >= STATE_FLUSH_INTERVAL:
             self._last_state_flush = now
             self.storage.flush()
-            write_state(self.state_path, self.snapshot_state())
+            state = self.snapshot_state()
+            write_state(self.state_path, state)
+            write_counts(os.path.join(self.data_dir, "counts.txt"), state)
 
     def checkpoint(self) -> None:
         if self._closed:
@@ -1496,7 +1532,7 @@ CRAWL SCOPES  (--scope local|global, -l/--local, -g/--global;
             politeness, allow/deny lists, depth and domain caps.
 
 KEY OPTIONS
-    --workers N            concurrent fetch workers (default 1)
+    -w, --workers N        concurrent fetch workers (default 1)
     --delay SECONDS        minimum delay between requests per host (1.0)
     --max-depth N          max link depth from a seed (10)
     --domain-cap N         max pages per domain (0 = unlimited)
@@ -1517,6 +1553,7 @@ KEY OPTIONS
 OUTPUT  (everything under --data-dir)
     crawled_links/YYYY-MM-DD.txt   unique URLs, appended per day
     extracted/YYYY-MM-DD.jsonl     --extract records
+    counts.txt                     live totals (links, pages, queue)
     botaghota.sqlite               seen set + frontier queue (atomic, WAL)
     state.json                     checkpoint, rewritten atomically
     bloom.bits[.count]             only with --bloom
@@ -1596,7 +1633,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Max pages per domain (0 = unlimited)")
     p.add_argument("--limit", type=int, default=0,
                    help="Stop after N pages (0 = run forever)")
-    p.add_argument("--workers", type=int, default=1,
+    p.add_argument("-w", "--workers", type=int, default=1,
                    help="Concurrent fetch workers (default: 1)")
     p.add_argument("--recrawl-hours", type=float, default=24.0,
                    help="Recrawl a page after this many hours "
